@@ -1,13 +1,13 @@
 # LiveKit Headless Audio Client
 
-Headless Python client for joining LiveKit audio conferences using a Bluetooth conference speakerphone (tested with NewPie).
+Headless Python client for joining LiveKit audio conferences using the NewLine NewPie conference speakerphone. Supports both **USB** and **Bluetooth** connections. USB is recommended — it's plug-and-play with no profile configuration required.
 
 ## Requirements
 
 - Python 3.13+
 - PipeWire 1.x + WirePlumber 0.5.x
-- BlueZ Bluetooth stack
 - PortAudio (`libportaudio2`)
+- BlueZ Bluetooth stack *(Bluetooth only)*
 
 ## Installation
 
@@ -16,13 +16,37 @@ Headless Python client for joining LiveKit audio conferences using a Bluetooth c
 sudo apt-get install libportaudio2 portaudio19-dev python3-venv
 
 # Python virtual environment and dependencies
-python3 -m venv ~/.venv
-~/.venv/bin/pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/pip install -e .
 ```
 
 ---
 
-## Configuring a New Linux Device
+## USB Setup (Recommended)
+
+Plug in the NewPie USB cable. Linux enumerates it as a standard USB Audio Class device — no drivers or profile configuration needed. Verify it appears:
+
+```bash
+pactl list cards short   # should show an alsa_card.usb-... entry for NewPie
+wpctl status             # confirm NewPie sink and source are listed
+```
+
+Set it as the default audio device:
+
+```bash
+wpctl set-default <newpie-sink-id>
+wpctl set-default <newpie-source-id>
+```
+
+Run the loopback test to confirm full-duplex at 48 kHz:
+
+```bash
+.venv/bin/alexa-audio
+```
+
+---
+
+## Bluetooth Setup
 
 Steps to set up a fresh headless Linux system for full-duplex Bluetooth conference audio.
 
@@ -145,19 +169,19 @@ After a reboot or Bluetooth reconnect, WirePlumber restores the `headset-head-un
 
 ---
 
-## Bluetooth Speakerphone: Daily Use
+## NewPie: Daily Use
 
 ### Test audio (mic → speaker loopback)
 
 ```bash
-~/.venv/bin/python test_newpie.py
+.venv/bin/alexa-audio
 ```
 
 The script runs a preflight check (verifies the device is connected and the profile is correct), then opens a loopback stream. Speak into the mic and you should hear yourself through the speaker. Press Ctrl+C to stop.
 
 ```bash
 # List all detected audio devices and active BT profile
-~/.venv/bin/python test_newpie.py --list
+.venv/bin/alexa-audio --list
 ```
 
 ### Check status
@@ -202,14 +226,31 @@ LIVEKIT_URL=wss://your-project.livekit.cloud
 LIVEKIT_ROOM=your-room-name
 LIVEKIT_API_KEY=your-api-key
 LIVEKIT_API_SECRET=your-api-secret
+
+# Optional: override audio devices (index or name substring).
+# Defaults to the PipeWire default sink/source when unset.
+#INPUT_DEVICE=pipewire
+#OUTPUT_DEVICE=pipewire
 ```
 
 The `.env` file is git-ignored — never commit credentials.
 
+To find the right values, run `alexa-devices` and use either the numeric index or any unique substring of the device name:
+
+```ini
+# by index
+INPUT_DEVICE=3
+OUTPUT_DEVICE=3
+
+# by name substring (case-insensitive)
+INPUT_DEVICE=NewPie
+OUTPUT_DEVICE=NewPie
+```
+
 ### 3. Run
 
 ```bash
-~/.venv/bin/python livekit_client.py
+.venv/bin/alexa-client
 ```
 
 At startup the script validates credentials and prints a **browser join URL**:
@@ -228,10 +269,13 @@ Open that URL on any browser or device to join the same room as the speakerphone
 ## Project Structure
 
 ```
-~/livekit-client/
-├── livekit_client.py   # LiveKit conference client with auto-reconnect
-├── test_newpie.py      # Bluetooth loopback test with preflight check
-├── requirements.txt    # Python dependencies
+alexa-custom/
+├── alexa_custom/
+│   ├── __init__.py
+│   ├── _env.py         # .env loader
+│   ├── audio.py        # NewPie preflight check and loopback test
+│   └── client.py       # LiveKit conference client with auto-reconnect
+├── pyproject.toml      # Package metadata and dependencies
 ├── .env                # Credentials — git-ignored, fill this in
 ├── .env.example        # Credentials template
 ├── .gitignore
@@ -307,7 +351,7 @@ wpctl status | grep NewPie          # should show * NewPie [vol: 1.00]
 wpctl set-volume <sink-id> 1.0      # force to 100% if needed
 
 # Quick loopback test: speak into mic, hear yourself in speaker
-~/.venv/bin/python test_newpie.py
+.venv/bin/alexa-audio
 
 # If profile reverted to A2DP (no mic), force it back
 pactl set-card-profile bluez_card.XX_XX_XX_XX_XX_XX headset-head-unit

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alexa-custom"
+version = "0.1.0"
+description = "LiveKit headless audio client for Bluetooth conference speakerphones"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.13"
+dependencies = [
+    "livekit>=1.1.0",
+    "livekit-api>=1.1.0",
+    "sounddevice>=0.5.0",
+    "numpy>=1.26.0",
+    "pulsectl>=23.0.0",
+]
+
+[project.scripts]
+alexa-client = "alexa_custom.client:main"
+alexa-audio = "alexa_custom.audio:main"
+alexa-devices = "alexa_custom.audio:main_devices"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["alexa_custom*"]

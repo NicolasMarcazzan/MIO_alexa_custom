@@ -3,7 +3,6 @@ import asyncio
 import logging
 import os
 import signal
-import sounddevice as sd
 
 from livekit.api import AccessToken, VideoGrants
 from livekit.rtc import (
@@ -15,26 +14,12 @@ from livekit.rtc import (
     TrackSource,
 )
 
+from alexa_custom._env import load_env, require_env
+import sounddevice as sd
 
-def _load_env():
-    """Load key=value pairs from .env in the same directory, without overriding existing env vars."""
-    env_file = os.path.join(os.path.dirname(__file__), ".env")
-    try:
-        with open(env_file) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key = key.strip()
-                value = value.strip()
-                if key and value and key not in os.environ:
-                    os.environ[key] = value
-    except FileNotFoundError:
-        pass
+from alexa_custom.audio import find_pipewire_device, play_startup_chime, set_pipewire_defaults
 
-
-_load_env()
+load_env()
 
 ROOM_URL = os.environ.get("LIVEKIT_URL", "")
 RECONNECT_DELAY = 5  # seconds between reconnect attempts
@@ -46,20 +31,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _require_env(key: str) -> str:
-    value = os.environ.get(key, "").strip()
-    if not value:
-        raise RuntimeError(
-            f"{key} is not set — fill it in ~/livekit-client/.env"
-        )
-    return value
-
-
 def get_token() -> str:
-    api_key = _require_env("LIVEKIT_API_KEY")
-    api_secret = _require_env("LIVEKIT_API_SECRET")
-    room = _require_env("LIVEKIT_ROOM")
-    _require_env("LIVEKIT_URL")
+    api_key = require_env("LIVEKIT_API_KEY")
+    api_secret = require_env("LIVEKIT_API_SECRET")
+    room = require_env("LIVEKIT_ROOM")
+    require_env("LIVEKIT_URL")
     return (
         AccessToken(api_key, api_secret)
         .with_identity("headless-participant")
@@ -71,9 +47,9 @@ def get_token() -> str:
 
 def make_browser_token(identity: str = "browser-user") -> str:
     """Generate a token for a browser participant with a distinct identity."""
-    api_key = _require_env("LIVEKIT_API_KEY")
-    api_secret = _require_env("LIVEKIT_API_SECRET")
-    room = _require_env("LIVEKIT_ROOM")
+    api_key = require_env("LIVEKIT_API_KEY")
+    api_secret = require_env("LIVEKIT_API_SECRET")
+    room = require_env("LIVEKIT_ROOM")
     return (
         AccessToken(api_key, api_secret)
         .with_identity(identity)
@@ -87,17 +63,10 @@ def browser_join_url(identity: str = "browser-user") -> str:
     """Return the meet.livekit.io URL a browser can open to join the same room."""
     import urllib.parse
     token = make_browser_token(identity)
-    room = _require_env("LIVEKIT_ROOM")
+    room = require_env("LIVEKIT_ROOM")
     params = urllib.parse.urlencode({"liveKitUrl": ROOM_URL, "token": token})
     return f"https://meet.livekit.io/custom/?{params}"
 
-
-def find_pipewire_device():
-    """Return the sounddevice index for the PipeWire ALSA device."""
-    return next(
-        (i for i, d in enumerate(sd.query_devices()) if d['name'] == 'pipewire'),
-        None,
-    )
 
 
 async def run_session(mic, player, stop_event: asyncio.Event):
@@ -142,10 +111,9 @@ async def run_session(mic, player, stop_event: asyncio.Event):
 
     try:
         await room.connect(ROOM_URL, get_token())
-        room_name = _require_env('LIVEKIT_ROOM')
+        room_name = require_env('LIVEKIT_ROOM')
         logger.info(f"Connected to {ROOM_URL}/{room_name} as {room.local_participant.identity}")
 
-        # Log participants already in the room at connect time.
         existing = list(room.remote_participants.values())
         if existing:
             for p in existing:
@@ -159,7 +127,6 @@ async def run_session(mic, player, stop_event: asyncio.Event):
         await room.local_participant.publish_track(track, opts)
         logger.info("Microphone track published — full duplex active")
 
-        # Periodic status: log participant count, subscribed track count, and playback buffer level.
         async def _status_loop():
             while True:
                 await asyncio.sleep(15)
@@ -170,7 +137,6 @@ async def run_session(mic, player, stop_event: asyncio.Event):
 
         status_task = asyncio.create_task(_status_loop())
 
-        # Wait until the room disconnects or we are asked to stop
         await asyncio.wait(
             [asyncio.create_task(disconnected.wait()),
              asyncio.create_task(stop_event.wait())],
@@ -178,8 +144,6 @@ async def run_session(mic, player, stop_event: asyncio.Event):
         )
         status_task.cancel()
     finally:
-        # Remove all tracked audio from the player before disconnecting so
-        # add_track() doesn't raise "already added" on the next reconnect.
         for t in list(subscribed_tracks):
             try:
                 await player.remove_track(t)
@@ -189,16 +153,34 @@ async def run_session(mic, player, stop_event: asyncio.Event):
         await room.disconnect()
 
 
-async def main():
-    # Fail immediately if credentials are missing — don't enter the reconnect loop.
+async def _async_main():
     logger.info(f"Browser join URL:\n  {browser_join_url()}")
+
+    input_spec = os.environ.get('INPUT_DEVICE', '').strip() or None
+    output_spec = os.environ.get('OUTPUT_DEVICE', '').strip() or None
+
+    # Route PipeWire to the requested devices, then always talk to LiveKit
+    # through the PipeWire virtual device — never open hw: devices directly.
+    if input_spec or output_spec:
+        await asyncio.to_thread(set_pipewire_defaults, input_spec, output_spec)
+        logger.info(f"PipeWire routed — input: {input_spec or 'default'}, output: {output_spec or 'default'}")
+        await asyncio.sleep(0.5)  # let PipeWire finish switching before opening streams
 
     pw_device = find_pipewire_device()
     if pw_device is None:
         raise RuntimeError("PipeWire ALSA device not found. Is PipeWire running?")
-    logger.info(f"Using PipeWire device index {pw_device}")
 
-    # input_sample_rate=48000 is standard WebRTC; PipeWire resamples to/from mSBC 16kHz
+    pw_name = sd.query_devices(pw_device)['name']
+    logger.info(f"Input device:  {pw_device} ({input_spec or pw_name})")
+    logger.info(f"Output device: {pw_device} ({output_spec or pw_name})")
+
+    try:
+        await asyncio.wait_for(asyncio.to_thread(play_startup_chime, pw_device), timeout=3.0)
+    except asyncio.TimeoutError:
+        logger.warning("Startup chime skipped: audio device not ready in time")
+    except Exception as e:
+        logger.warning(f"Startup chime skipped: {e}")
+
     devices = MediaDevices(input_sample_rate=48000, output_sample_rate=48000, num_channels=1)
 
     stop_event = asyncio.Event()
@@ -243,5 +225,9 @@ async def main():
         logger.info("Done.")
 
 
+def main():
+    asyncio.run(_async_main())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
