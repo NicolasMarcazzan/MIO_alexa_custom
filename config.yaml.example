@@ -90,21 +90,21 @@ wake_words:
     aliases:
       - "ehi galileo"       # alternative recognition phrase for the same group
     triggers:               # commands active only after this wake word
-      - phrase: "chiama stefano"
+      - phrase: "chiama Stefano"
         actions:
           - type: ask
-            text: "Vuoi chiamare Stefano?"
+            text: "Vuoi chiamare Alessandro?"
             lang: "it-IT"   # BCP-47 language tag for TTS (default: it-IT)
             timeout: 5.0    # seconds to wait for a reply
             on_reply:
               - phrase: "si"
                 actions:
                   - type: say
-                    text: "Sto chiamando Stefano"
+                    text: "Sto chiamando Alessandro"
                   - type: livekit_join
                   - type: telegram
                     text: "Collegati con casa <room>"
-                    # chat_id: "123456789"  # overrides TELEGRAM_CHAT_ID env var
+                    # chat_id: "12345678"  # overrides TELEGRAM_CHAT_ID env var
               - phrase: "no"
                 actions:
                   - type: say
