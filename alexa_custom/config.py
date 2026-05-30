@@ -242,9 +242,9 @@ def _parse_actions_config(raw: dict, source: str = "config") -> ActionsConfig:
         raise ConfigError(f"{source}: 'stt' must be a mapping if present")
 
     stt_backend = str(stt_section.get("backend", raw.get("stt_backend", "vosk")))
-    if stt_backend not in ("vosk", "sherpa-onnx"):
+    if stt_backend not in ("vosk", "sherpa-onnx", "whisper"):
         raise ConfigError(
-            f"{source}: 'stt.backend' must be 'vosk' or 'sherpa-onnx', got {stt_backend!r}"
+            f"{source}: 'stt.backend' must be 'vosk', 'sherpa-onnx', or 'whisper', got {stt_backend!r}"
         )
 
     stt_model_path_raw = stt_section.get("model_path") or raw.get("stt_model_path")

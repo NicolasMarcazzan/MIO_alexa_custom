@@ -4,8 +4,8 @@
 The system SHALL load configuration from `config.yaml` when present. The file SHALL support an optional top-level `env:` key containing a flat string-to-string mapping of environment variables. Values in `env:` SHALL be written into `os.environ`, overwriting any existing values. The `wake_words` key SHALL be a list of wake word group objects; each object SHALL have a required string `word` field, an optional `aliases` list of strings, and an optional `triggers` list following the existing trigger schema. A top-level `triggers` key SHALL be accepted as a global fallback and MAY be an empty list or absent. All other top-level keys are parsed using the existing actions config schema.
 
 #### Scenario: env section populates os.environ
-- **WHEN** `config.yaml` contains `env: { LIVEKIT_URL: wss://example.com }`
-- **THEN** `os.environ["LIVEKIT_URL"]` equals `"wss://example.com"` after load
+- **WHEN** `config.yaml` contains `env: { LIVEKIT_URL: wss://alexa-custom-u4t05e8q.livekit.cloud }`
+- **THEN** `os.environ["LIVEKIT_URL"]` equals `"wss://alexa-custom-u4t05e8q.livekit.cloud"` after load
 
 #### Scenario: Wake word group with aliases parsed correctly
 - **WHEN** `config.yaml` contains a wake word group with `word: galileo` and `aliases: [hey galileo]`

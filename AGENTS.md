@@ -26,7 +26,7 @@ Manual entry points:
 alexa-client [--web] [--web-port PORT]   # main daemon
 alexa-audio                              # mic→speaker loopback test
 alexa-devices                            # list audio devices
-alexa-setup                              # download/update STT models
+alexa-setup                              # download/update STT models (--whisper for whisper)
 ```
 
 ## Audio I/O constraints (Arduino Uno Q)
@@ -55,7 +55,7 @@ PortAudio (used by `sounddevice` and `PyAudio`) has **no native PipeWire backend
 ```
 alexa_custom/
   client.py       main loop, LiveKit session, wake-word dispatch
-  stt.py          speech-to-text pipeline (Vosk + sherpa-onnx)
+  stt.py          speech-to-text pipeline (Vosk + sherpa-onnx + whisper)
   tts.py          text-to-speech (Piper)
   audio.py        PipeWire routing, AudioWatcher, device enumeration
   mqtt.py         MQTT client, Home Assistant Discovery

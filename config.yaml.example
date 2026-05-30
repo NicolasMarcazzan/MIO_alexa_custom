@@ -11,10 +11,10 @@
 
 env:
   # --- LiveKit (required) ---
-  LIVEKIT_URL: wss://your-project.livekit.cloud
-  LIVEKIT_ROOM: your-room-name
-  LIVEKIT_API_KEY: your-api-key
-  LIVEKIT_API_SECRET: your-api-secret
+  LIVEKIT_URL: wss://alexa-custom-u4t05e8q.livekit.cloud
+  LIVEKIT_ROOM: alexa-stanza
+  LIVEKIT_API_KEY: APIJ5drZtgbbAxQ
+  LIVEKIT_API_SECRET:V9lrooIcGPvRWNlaezaEQY9DG1Sm7spLg3dbMeTEuF3
 
   # --- Audio devices ---
   # Substring of the PipeWire/ALSA device name, or a sounddevice index.
@@ -165,18 +165,21 @@ tts:
 # ---------------------------------------------------------------------------
 # STT — speech-to-text backend
 # ---------------------------------------------------------------------------
-# Two backends are available:
+# Three backends are available:
 #   vosk        — default, grammar-constrained recognition (low CPU)
-#   sherpa-onnx — streaming open-vocabulary model (higher CPU, better accuracy)
+#   sherpa-onnx — streaming Zipformer transducer (higher accuracy)
+#   whisper     — OpenAI Whisper tiny multilingual via sherpa-onnx (best accuracy)
 #
-# sherpa-onnx model download:
-#   python -m alexa_custom.setup --sherpa-onnx
-#   (or: hf download hudaiapa88/sherpa-stt-onnx --local-dir ./models --include "it/kroko_128l/*")
+# Model downloads:
+#   alexa-setup                                    # Vosk (small Italian)
+#   alexa-setup --sherpa-onnx                      # Zipformer transducer (kroko_128l)
+#   alexa-setup --whisper                          # Whisper tiny multilingual INT8
 
 stt:
   backend: vosk
-  # model_path: models/it/kroko_128l  # Optional: override default model path for sherpa-onnx
   # model_path: models/it             # For vosk
+  # model_path: models/it/kroko_128l  # For sherpa-onnx
+  # model_path: models/whisper-tiny   # For whisper (default)
 
 # ---------------------------------------------------------------------------
 # Startup actions

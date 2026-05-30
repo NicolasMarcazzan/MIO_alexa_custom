@@ -39,6 +39,9 @@ class TelegramClient:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.post(url, json={"chat_id": chat_id, "text": text})
                 resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Telegram send_message failed: {e}")
+            logger.error(f"Telegram response body: {e.response.text}")
         except Exception as e:
             logger.error(f"Telegram send_message failed: {e}")
 

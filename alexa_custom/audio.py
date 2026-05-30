@@ -3,15 +3,64 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import logging
+import wave
 from typing import Callable
 import numpy as np
 import pulsectl
 
-# Resolved once at import time; None if the tool is absent (aplay fallback used).
+# Resolved once at import time; None if the tool is absent.
 _PW_PLAY: str | None = shutil.which("pw-play")
+_PW_CLI: str | None = shutil.which("pw-cli")
+_PA_CAT: str | None = shutil.which("pacat")
+_PA_PLAY: str | None = shutil.which("paplay")
+
+_CACHED_HAS_REAL_SINKS: bool | None = None
+
+def _has_real_pw_sinks() -> bool:
+    """Check whether PipeWire has at least one non-dummy audio sink.
+
+    On WSL (and similar environments) PipeWire may be installed but only
+    offer an ``auto_null`` dummy sink.  In that case ``pw-play`` would
+    produce silence, and we should fall back to PulseAudio-native tools
+    (``pacat`` / ``paplay``) which route through WSLg or ``pipewire-pulse``.
+
+    The result is cached so the subprocess is only spawned once.
+    """
+    global _CACHED_HAS_REAL_SINKS
+    if _CACHED_HAS_REAL_SINKS is not None:
+        return _CACHED_HAS_REAL_SINKS
+
+    if not _PW_CLI:
+        _CACHED_HAS_REAL_SINKS = False
+        return False
+
+    try:
+        result = subprocess.run(
+            [_PW_CLI, "list-objects", "Node"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            _CACHED_HAS_REAL_SINKS = False
+            return False
+        # A healthy PipeWire graph has at least one non-dummy Audio/Sink.
+        _CACHED_HAS_REAL_SINKS = (
+            '"Audio/Sink"' in result.stdout
+            and 'node.name = "auto_null"' not in result.stdout
+        )
+    except Exception:
+        _CACHED_HAS_REAL_SINKS = False
+    return _CACHED_HAS_REAL_SINKS
+
+
+def invalidate_sink_cache() -> None:
+    """Force re-evaluation on the next call (e.g. after hardware hot-plug)."""
+    global _CACHED_HAS_REAL_SINKS
+    _CACHED_HAS_REAL_SINKS = None
+
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +225,9 @@ def set_output_volume(pulse: pulsectl.Pulse, output_spec: str | None, volume: fl
     """Set PulseAudio volume on the configured output sink."""
     if volume <= 0:
         return
+
     needle = (output_spec or "NewPie").lower()
+    # 1. Try matching the spec against known sinks
     sink = next(
         (
             s
@@ -185,12 +236,26 @@ def set_output_volume(pulse: pulsectl.Pulse, output_spec: str | None, volume: fl
         ),
         None,
     )
-    if not sink:
-        logger.warning(f"Cannot set volume: sink matching {output_spec!r} not found")
+    if sink:
+        from pulsectl import PulseVolumeInfo
+        pulse.volume_set(sink, PulseVolumeInfo(volume, channels=2))
+        logger.info("Set output volume to %d%% on %s", round(volume * 100), sink.description)
         return
+
+    # 2. Fallback: spec didn't match any sink (e.g. "pipewire" on WSLg).
+    #    Use the default sink (RDPSink on WSLg, or pipewire-pulse's default).
+    sinks = pulse.sink_list()
+    if not sinks:
+        logger.warning("Cannot set volume: no sinks available")
+        return
+    default_sink_name = pulse.server_info().default_sink_name
+    default_sink = next((s for s in sinks if s.name == default_sink_name), sinks[0])
     from pulsectl import PulseVolumeInfo
-    pulse.volume_set(sink, PulseVolumeInfo(volume, channels=2))
-    logger.info(f"Set output volume to {volume:.0%} on {sink.description}")
+    pulse.volume_set(default_sink, PulseVolumeInfo(volume, channels=2))
+    logger.info(
+        "Set output volume to %d%% on default sink %s (spec %r not matched)",
+        round(volume * 100), default_sink.description, output_spec,
+    )
 
 
 def enforce_audio_state(
@@ -310,8 +375,9 @@ class AudioWatcher(threading.Thread):
 
             self.connected = ok
             self.conn_type = conn
-            # PortAudio's view of devices can shift on hot-plug — drop the cache.
+            # PortAudio's view of devices can shift on hot-plug — drop the caches.
             invalidate_pipewire_device_cache()
+            invalidate_sink_cache()
             if self.on_status_change:
                 self.on_status_change(ok, conn)
 
@@ -482,162 +548,233 @@ def speakerphone():
         sys.exit(1)
 
 
+def _write_float32_wav(audio: np.ndarray, samplerate: int) -> bytes:
+    """Pack a float32 numpy array into an in-memory WAV (s16le PCM)."""
+    import io
+    import wave
+
+    channels = audio.shape[1] if audio.ndim > 1 else 1
+    s16 = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)
+        wf.setframerate(samplerate)
+        wf.writeframes(np.ascontiguousarray(s16).tobytes())
+    return buf.getvalue()
+
+
 def _play_array(audio: np.ndarray, samplerate: int) -> None:
-    """Play a float32 numpy audio array via pw-play (PipeWire) or aplay (ALSA fallback)."""
+    """Play a float32 numpy audio array.
+
+    Fallback chain (first working method wins):
+      1. ``pw-play`` — native PipeWire (only if PipeWire has real audio sinks)
+      2. ``paplay``  — PulseAudio WAV playback (works on WSLg and pipewire-pulse)
+      3. ``aplay``   — ALSA with PipeWire device
+      4. ``sounddevice`` — PortAudio / dev fallback
+    """
     channels = audio.shape[1] if audio.ndim > 1 else 1
     frames = audio.shape[0]
     duration_s = frames / samplerate
-    # Give pw-play 3× the audio duration plus 5 s startup, capped at 30 s.
     play_timeout = min(max(duration_s * 3 + 5, 8), 30)
     data = np.ascontiguousarray(audio).tobytes()
 
-    if _PW_PLAY:
+    def _try_pw_play() -> bool:
+        if not _PW_PLAY or not _has_real_pw_sinks():
+            return False
+        logger.debug("_play_array: trying pw-play")
         cmd = [
-            _PW_PLAY,
-            "-a",
-            "--rate",
-            str(samplerate),
-            "--channels",
-            str(channels),
-            "--format",
-            "f32",
-            "-",
+            _PW_PLAY, "-a", "--rate", str(samplerate),
+            "--channels", str(channels), "--format", "f32", "-",
         ]
-    else:
+        result = subprocess.run(
+            cmd, input=data, timeout=play_timeout,
+            check=False, stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            logger.warning("pw-play failed (%d), trying next method\u2026", result.returncode)
+            return False
+        logger.debug("_play_array: pw-play succeeded")
+        return True
+
+    def _try_paplay() -> bool:
+        if not _PA_PLAY:
+            return False
+        logger.debug("_play_array: trying paplay (temp WAV)")
+        wav_bytes = _write_float32_wav(audio, samplerate)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_path = f.name
+            f.write(wav_bytes)
+        try:
+            result = subprocess.run(
+                [_PA_PLAY, tmp_path],
+                timeout=duration_s + 5,
+                check=False, stderr=subprocess.PIPE,
+            )
+            if result.returncode != 0:
+                stderr_text = result.stderr.decode(errors="replace").strip()
+                logger.warning("paplay failed (%d): %s, trying next method\u2026", result.returncode, stderr_text)
+                return False
+            logger.debug("_play_array: paplay succeeded")
+            return True
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    def _try_aplay() -> bool:
+        aplay_path = shutil.which("aplay")
+        if not aplay_path:
+            return False
+        logger.debug("_play_array: trying aplay")
         cmd = [
-            "aplay",
-            "-D",
-            "pipewire",
-            "-r",
-            str(samplerate),
-            "-f",
-            "FLOAT_LE",
-            "-c",
-            str(channels),
-            "-q",
+            aplay_path, "-D", "pipewire",
+            "-r", str(samplerate), "-f", "FLOAT_LE",
+            "-c", str(channels), "-q",
         ]
+        result = subprocess.run(
+            cmd, input=data, timeout=play_timeout,
+            check=False, stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            stderr_text = result.stderr.decode(errors="replace").strip()
+            logger.warning("aplay failed (%d): %s, trying next method\u2026", result.returncode, stderr_text)
+            return False
+        logger.debug("_play_array: aplay succeeded")
+        return True
+
+    def _try_sounddevice() -> bool:
+        try:
+            logger.debug("_play_array: trying sounddevice")
+            import sounddevice as sd
+            sd.play(audio, samplerate, channels=channels, blocking=True)
+            sd.wait()
+            logger.debug("_play_array: sounddevice succeeded")
+            return True
+        except Exception as e:
+            logger.error("sounddevice playback failed: %s", e)
+            return False
 
     with _audio_lock:
         _playback_active.set()
         try:
-            subprocess.run(
-                cmd,
-                input=data,
-                timeout=play_timeout,
-                check=False,
-                stderr=subprocess.DEVNULL,
-            )
+            for attempt in (_try_pw_play, _try_paplay, _try_aplay, _try_sounddevice):
+                if attempt():
+                    break
+            else:
+                raise RuntimeError("All playback methods failed")
             if _POST_PLAYBACK_MS > 0:
                 time.sleep(_POST_PLAYBACK_MS / 1000.0)
         except Exception as e:
-            logger.error(f"_play_array failed: {e}")
+            logger.error("_play_array failed: %s", e)
         finally:
             _playback_active.clear()
 
 
-def _play_raw(data: bytes, samplerate: int, channels: int) -> None:
-    """Play raw float32 audio via pw-play (native PipeWire) or aplay (ALSA fallback)."""
-    # f32 = 4 bytes per sample; compute timeout the same way as _play_array.
-    frames = len(data) // (channels * 4)
-    duration_s = frames / samplerate
-    play_timeout = min(max(duration_s * 3 + 5, 8), 30)
+def _read_wav_as_float32(path: str) -> tuple[np.ndarray, int]:
+    """Read a PCM WAV file into a float32 numpy array shaped (frames, channels)."""
+    with wave.open(path, "rb") as wf:
+        samplerate = wf.getframerate()
+        channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        raw = wf.readframes(wf.getnframes())
 
-    if _PW_PLAY:
-        cmd = [
-            _PW_PLAY,
-            "-a",  # raw mode: honour --format/--rate/--channels instead of auto-detect
-            "--rate",
-            str(samplerate),
-            "--channels",
-            str(channels),
-            "--format",
-            "f32",
-            "-",
-        ]
+    if sampwidth != 2:
+        raise ValueError(f"Unsupported sample width {sampwidth} (expected 16-bit PCM)")
+
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        samples = samples.reshape(-1, channels)
     else:
-        cmd = [
-            "aplay",
-            "-D",
-            "pipewire",
-            "-r",
-            str(samplerate),
-            "-f",
-            "FLOAT_LE",
-            "-c",
-            str(channels),
-            "-q",
-        ]
-
-    with _audio_lock:
-        _playback_active.set()
-        try:
-            subprocess.run(
-                cmd,
-                input=data,
-                timeout=play_timeout,
-                check=False,
-                stderr=subprocess.DEVNULL,
-            )
-            if _POST_PLAYBACK_MS > 0:
-                time.sleep(_POST_PLAYBACK_MS / 1000.0)
-        except Exception as e:
-            logger.error(f"Failed to run audio playback command: {e}")
-        finally:
-            _playback_active.clear()
+        samples = samples.reshape(-1, 1)
+    return samples, samplerate
 
 
 def play_wav_file(file_path: str) -> None:
-    """Play a WAV file via pw-play (native PipeWire) or aplay (ALSA fallback)."""
-    if _PW_PLAY:
-        cmd = [_PW_PLAY, file_path]
-    else:
-        cmd = ["aplay", "-D", "pipewire", "-q", file_path]
+    """Play a WAV file via the standard fallback chain (pw-play → paplay → aplay → sd)."""
+    samples, samplerate = _read_wav_as_float32(file_path)
+    _play_array(samples, samplerate)
 
-    with _audio_lock:
-        _playback_active.set()
-        try:
-            subprocess.run(cmd, timeout=60, check=False, stderr=subprocess.DEVNULL)
-            if _POST_PLAYBACK_MS > 0:
-                time.sleep(_POST_PLAYBACK_MS / 1000.0)
-        except Exception:
-            pass
-        finally:
-            _playback_active.clear()
+
+
+
+def record_wav_file_sounddevice(file_path: str, duration: float) -> None:
+    """Dev-mode recording via sounddevice. Writes 16 kHz mono WAV."""
+    import wave
+    import sounddevice as sd
+
+    rate = 16000
+    channels = 1
+    print("   [listening...]", flush=True)
+    try:
+        rec = sd.rec(int(duration * rate), samplerate=rate, channels=channels,
+                     dtype="int16", blocking=True)
+    except Exception as e:
+        logger.error(f"record_wav_file_sounddevice failed: {e}")
+        rec = None
+
+    with wave.open(file_path, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        if rec is not None:
+            wf.writeframes(rec.tobytes())
+        else:
+            wf.writeframes(b"")
 
 
 def record_wav_file(file_path: str, duration: float) -> None:
-    """Record a WAV file from the default PipeWire source."""
+    """Record a WAV file from the default PipeWire source (parec/pw-record/sounddevice)."""
     rate = 16000
     channels = 1
     parec = shutil.which("parec")
     if parec:
-        import threading
+        import tempfile
         import wave
-        cmd = [
-            parec,
-            "--rate",
-            str(rate),
-            "--channels",
-            str(channels),
-            "--format",
-            "s16le",
-            "-",
-        ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-        def kill_after():
-            time.sleep(duration)
-            proc.terminate()
+        raw_fd, raw_path = tempfile.mkstemp(suffix=".raw")
+        os.close(raw_fd)
+        try:
+            cmd = [
+                parec, "--rate", str(rate),
+                "--channels", str(channels),
+                "--format", "s16le",
+            ]
+            with open(raw_path, "wb") as raw_file:
+                proc = subprocess.Popen(
+                    cmd, stdout=raw_file, stderr=subprocess.PIPE,
+                )
 
-        threading.Thread(target=kill_after, daemon=True).start()
-        pcm_data = proc.stdout.read()
-        proc.wait()
+                def kill_after():
+                    time.sleep(duration)
+                    try:
+                        proc.terminate()
+                    except ProcessLookupError:
+                        pass
 
-        with wave.open(file_path, "wb") as wf:
-            wf.setnchannels(channels)
-            wf.setsampwidth(2)
-            wf.setframerate(rate)
-            wf.writeframes(pcm_data)
+                threading.Thread(target=kill_after, daemon=True).start()
+                _, stderr_data = proc.communicate()
+                exit_code = proc.returncode
+
+            if exit_code not in (0, -15, -9):
+                raise RuntimeError(
+                    f"parec exited {exit_code}: {stderr_data.decode(errors='replace')}"
+                )
+
+            with open(raw_path, "rb") as f:
+                pcm_data = f.read()
+
+            with wave.open(file_path, "wb") as wf:
+                wf.setnchannels(channels)
+                wf.setsampwidth(2)
+                wf.setframerate(rate)
+                wf.writeframes(pcm_data)
+        finally:
+            try:
+                os.unlink(raw_path)
+            except OSError:
+                pass
         return
 
     aplay = shutil.which("aplay")
@@ -654,11 +791,18 @@ def record_wav_file(file_path: str, duration: float) -> None:
             str(rate),
             file_path,
         ]
-    else:
-        pw_record = shutil.which("pw-record")
-        if not pw_record:
-            logger.error("No recording tool found (parec, aplay, or pw-record)")
-            return
+        try:
+            result = subprocess.run(cmd, check=False, timeout=duration + 2,
+                                    stderr=subprocess.PIPE)
+            if result.returncode == 0:
+                return
+            # aplay -D pipewire failed — likely no PipeWire daemon (dev machine).
+            logger.info(f"aplay -D pipewire failed ({result.returncode}), falling back to sounddevice...")
+        except Exception as e:
+            logger.info(f"aplay -D pipewire failed ({e}), falling back to sounddevice...")
+
+    pw_record = shutil.which("pw-record")
+    if pw_record:
         cmd = [
             pw_record,
             "--rate",
@@ -669,11 +813,14 @@ def record_wav_file(file_path: str, duration: float) -> None:
             "s16",
             file_path,
         ]
+        try:
+            subprocess.run(cmd, check=True, timeout=duration + 2)
+            return
+        except Exception as e:
+            logger.error(f"pw-record failed: {e}")
 
-    try:
-        subprocess.run(cmd, check=True, timeout=duration + 2)
-    except Exception as e:
-        logger.error(f"Recording failed: {e}")
+    # Final fallback: sounddevice
+    record_wav_file_sounddevice(file_path, duration)
 
 
 def play_tone(name: str):
@@ -984,58 +1131,118 @@ def main_devices():
 def main_test():
     import tempfile
     import os
+    import sys
+    import logging
+    logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s", stream=sys.stderr)
+
     from alexa_custom.tts import init_engine, get_engine
     from alexa_custom.config import load_config
 
     print("--- Audio System Test ---")
 
-    # Load config to respect INPUT_DEVICE / OUTPUT_DEVICE and env: section
+    # Determine available playback tools
+    _dev_mode = not _PW_PLAY
+    has_real_pw = _PW_PLAY and _has_real_pw_sinks()
+    if _PW_PLAY:
+        if has_real_pw:
+            print("   Playback method: pw-play (real PipeWire sinks detected)")
+        else:
+            print("   Playback method: pw-play exists but only dummy sinks → will try pacat/aplay/sounddevice")
+    if _PA_CAT:
+        print(f"   PulseAudio playback available: pacat ({_PA_CAT})")
+    if _dev_mode and not _PA_CAT and not shutil.which("aplay"):
+        print("   [dev mode: no PipeWire/PulseAudio/ALSA tools, using sounddevice]")
+        try:
+            import sounddevice as sd
+            sd.check_output_settings(device=None)
+            default_out = sd.default.device[1]
+            if default_out is None:
+                print("   WARNING: No default output device found in sounddevice")
+            else:
+                info = sd.query_devices(default_out)
+                print(f"   Default sounddevice output: [{default_out}] {info['name']}")
+        except Exception as e:
+            print(f"   WARNING: sounddevice check failed: {e}")
+
+    # Show the default PulseAudio sink
+    try:
+        with pulsectl.Pulse("alexa-test-diag") as pulse:
+            info = pulse.server_info()
+            print(f"   PulseAudio server: {info.server_name} {info.server_version}")
+            default_sink = next(
+                (s for s in pulse.sink_list() if s.name == info.default_sink_name),
+                None,
+            )
+            if default_sink:
+                print(f"   Default PA sink: {default_sink.description} (volume: {default_sink.volume.value_flat:.0%})")
+    except Exception:
+        pass
+
     config = load_config("config.yaml")
 
-    input_spec = os.environ.get("INPUT_DEVICE", "").strip() or None
-    output_spec = os.environ.get("OUTPUT_DEVICE", "").strip() or None
+    if not _dev_mode:
+        input_spec = os.environ.get("INPUT_DEVICE", "").strip() or None
+        output_spec = os.environ.get("OUTPUT_DEVICE", "").strip() or None
+        try:
+            set_pipewire_defaults(input_spec, output_spec)
+        except Exception as e:
+            print(f"WARNING: Could not set PipeWire defaults: {e}")
 
+        if config and config.output_volume > 0:
+            try:
+                with pulsectl.Pulse("alexa-test") as pulse:
+                    set_output_volume(pulse, output_spec, config.output_volume)
+            except Exception as e:
+                print(f"WARNING: Could not set output volume: {e}")
+
+    # Step 1: Play tone
     try:
-        set_pipewire_defaults(input_spec, output_spec)
+        print("1. Playing tone...")
+        play_tone("info")
+        print("   [tone played OK]")
     except Exception as e:
-        print(f"WARNING: Could not set PipeWire defaults: {e}")
+        print(f"ERROR: Tone playback failed: {e}", file=sys.stderr)
 
-    if config and config.output_volume > 0:
-        with pulsectl.Pulse("alexa-test") as pulse:
-            set_output_volume(pulse, output_spec, config.output_volume)
-
-    print("1. Playing tone...")
-    play_tone("info")
-
-    print("2. TTS: Asking for name...")
-    # Initialize engine with settings from config if available
-    if config:
-        init_engine(
-            backend_type=config.tts_backend,
-            voice=config.tts_voice,
-            preroll_ms=config.tts_preroll_ms,
-        )
-    else:
-        init_engine(backend_type="piper")
-    
-    get_engine().say("Ciao, come ti chiami?")
-
-    print("3. Recording 5 seconds of audio...")
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        tmp_wav = f.name
-    
+    # Step 2: TTS prompt
     try:
+        print("2. TTS: Asking for name...")
+        if config:
+            init_engine(
+                backend_type=config.tts_backend,
+                voice=config.tts_voice,
+                preroll_ms=config.tts_preroll_ms,
+            )
+        else:
+            init_engine(backend_type="piper")
+        get_engine().say("Ciao, come ti chiami?")
+        print("   [TTS prompt played OK]")
+    except Exception as e:
+        print(f"ERROR: TTS playback failed: {e}", file=sys.stderr)
+
+    # Step 3: Record
+    try:
+        print("3. Recording 5 seconds of audio...")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_wav = f.name
         print("   [RECORDING NOW - SPEAK INTO MICROPHONE]")
         record_wav_file(tmp_wav, 5.0)
         print("   [DONE]")
+    except Exception as e:
+        print(f"ERROR: Recording failed: {e}", file=sys.stderr)
+        tmp_wav = None
 
-        print("4. TTS: Announcing playback...")
-        get_engine().say("Ecco la registrazione:")
+    # Steps 4-5: Playback
+    if tmp_wav is not None and os.path.exists(tmp_wav):
+        try:
+            print("4. TTS: Announcing playback...")
+            get_engine().say("Ecco la registrazione:")
 
-        print("5. Playing back recorded sound...")
-        play_wav_file(tmp_wav)
-    finally:
-        if os.path.exists(tmp_wav):
+            print("5. Playing back recorded sound...")
+            play_wav_file(tmp_wav)
+            print("   [playback done]")
+        except Exception as e:
+            print(f"ERROR: Playback failed: {e}", file=sys.stderr)
+        finally:
             os.remove(tmp_wav)
 
     print("\nTest completed.")

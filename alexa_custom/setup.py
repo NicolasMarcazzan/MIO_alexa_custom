@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+import tarfile
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -14,6 +15,17 @@ _SHERPA_MODELS = {
     ),
 }
 _SHERPA_DEST = Path("models/it/kroko_128l")
+
+_WHISPER_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
+    "/sherpa-onnx-whisper-tiny.tar.bz2"
+)
+_WHISPER_DEST = Path("models/whisper-tiny")
+_WHISPER_FILES = {
+    "tiny-encoder.int8.onnx",
+    "tiny-decoder.int8.onnx",
+    "tiny-tokens.txt",
+}
 
 
 def download_sherpa_onnx(lang: str = "ita", force: bool = False) -> None:
@@ -64,6 +76,48 @@ def download_sherpa_onnx(lang: str = "ita", force: bool = False) -> None:
         sys.exit(1)
 
     print(f"sherpa-onnx model ready at {dest.resolve()}")
+
+
+def download_whisper(force: bool = False) -> None:
+    dest = _WHISPER_DEST
+
+    if dest.is_dir() and not force:
+        missing = [f for f in _WHISPER_FILES if not (dest / f).is_file()]
+        if not missing:
+            print(
+                f"Whisper model already present at {dest.resolve()} — skipping (use --force to replace)."
+            )
+            return
+
+    if dest.exists() and force:
+        print(f"Removing existing Whisper model at {dest.resolve()} …")
+        shutil.rmtree(dest)
+
+    archive = Path("sherpa-onnx-whisper-tiny.tar.bz2")
+    print(f"Downloading Whisper tiny model (INT8, ~100 MB) …")
+    _download(_WHISPER_URL, archive)
+
+    print(f"Extracting {archive} …")
+    try:
+        with tarfile.open(archive, "r:bz2") as tf:
+            tf.extractall(".")
+    except Exception as exc:
+        print(f"Extraction failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        archive.unlink(missing_ok=True)
+
+    # The archive extracts to sherpa-onnx-whisper-tiny/
+    extracted = Path("sherpa-onnx-whisper-tiny")
+    if not extracted.is_dir():
+        print("Extracted directory not found — archive structure unexpected.", file=sys.stderr)
+        sys.exit(1)
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        shutil.rmtree(dest)
+    extracted.rename(dest)
+    print(f"Whisper model ready at {dest.resolve()}")
 
 
 _VOSK_MODELS = {
@@ -209,6 +263,11 @@ def main() -> None:
         action="store_true",
         help="Also download the sherpa-onnx Paraformer-ita model (alternative STT backend)",
     )
+    parser.add_argument(
+        "--whisper",
+        action="store_true",
+        help="Download the sherpa-onnx Whisper tiny multilingual model (INT8, ~100 MB)",
+    )
     args = parser.parse_args()
 
     if not args.no_vosk:
@@ -217,6 +276,8 @@ def main() -> None:
         download_piper_voice(args.piper_voice, force=args.force)
     if args.sherpa_onnx:
         download_sherpa_onnx(force=args.force)
+    if args.whisper:
+        download_whisper(force=args.force)
 
 
 if __name__ == "__main__":

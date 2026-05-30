@@ -15,9 +15,9 @@ nano .env
 ### LiveKit Credentials
 | Variable | Description |
 |----------|-------------|
-| `LIVEKIT_URL` | `wss://your-project.livekit.cloud` |
-| `LIVEKIT_API_KEY` | Your API Key |
-| `LIVEKIT_API_SECRET` | Your API Secret |
+| `LIVEKIT_URL` | `wss://alexa-custom-u4t05e8q.livekit.cloud` |
+| `LIVEKIT_API_KEY` | APIJ5drZtgbbAxQ |
+| `LIVEKIT_API_SECRET` | V9lrooIcGPvRWNlaezaEQY9DG1Sm7spLg3dbMeTEuF3 |
 | `LIVEKIT_ROOM` | The room name to join |
 
 ### Audio Targeting

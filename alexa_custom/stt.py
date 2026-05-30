@@ -29,6 +29,7 @@ _CHUNK = 4096
 _MODEL_PATH = os.environ.get("VOSK_MODEL_PATH", "models/it")
 _STT_COOLDOWN = 1.0
 _SHERPA_MODEL_PATH = os.environ.get("SHERPA_ONNX_PATH", "models/sherpa-onnx")
+_WHISPER_MODEL_PATH = os.environ.get("WHISPER_MODEL_PATH", "models/whisper-tiny")
 
 # Energy VAD for sherpa-onnx stage-1 wake-word detection.
 # After speech is heard, if RMS stays below this threshold for
@@ -182,7 +183,78 @@ class SherpaOnnxSTT(STTBackend):
         self._delegate.reset(self._stream)
 
 
+class WhisperSTT(STTBackend):
+    """Whisper-based STT via sherpa-onnx offline recognizer.
+
+    Whisper is a non-streaming encoder-decoder model: it processes the full
+    audio segment at once rather than chunk-by-chunk.  This backend buffers
+    all audio and only transcribes on ``finalize()``.  Wake-word detection
+    relies on the caller's VAD (energy-based) to trigger finalization when
+    the user stops speaking.
+    """
+
+    def __init__(self, model_dir: str, num_threads: int = 4):
+        import sherpa_onnx
+
+        if not os.path.isdir(model_dir):
+            raise RuntimeError(
+                f"Whisper model not found at {model_dir!r}. "
+                f"Run 'alexa-setup --whisper' to download it."
+            )
+
+        encoder = os.path.join(model_dir, "tiny-encoder.int8.onnx")
+        decoder = os.path.join(model_dir, "tiny-decoder.int8.onnx")
+        tokens = os.path.join(model_dir, "tiny-tokens.txt")
+
+        if not os.path.exists(encoder):
+            encoder = os.path.join(model_dir, "tiny-encoder.onnx")
+        if not os.path.exists(decoder):
+            decoder = os.path.join(model_dir, "tiny-decoder.onnx")
+
+        self._recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
+            encoder=encoder,
+            decoder=decoder,
+            tokens=tokens,
+            language="it",
+            task="transcribe",
+            num_threads=num_threads,
+            provider="cpu",
+        )
+        self._buffer = b""
+        self._result = ""
+
+    def accept_waveform(self, data: bytes) -> bool:
+        self._buffer += data
+        return False  # offline — recognition deferred to finalize()
+
+    def text(self) -> str:
+        return self._result
+
+    def partial_text(self) -> str:
+        return ""  # no streaming partial results from offline Whisper
+
+    def reset(self) -> None:
+        self._buffer = b""
+        self._result = ""
+
+    def finalize(self) -> str:
+        if not self._buffer:
+            return ""
+        samples = (
+            np.frombuffer(self._buffer, dtype=np.int16).astype(np.float32) / 32768.0
+        )
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(sample_rate=16000, waveform=samples)
+        self._recognizer.decode_stream(stream)
+        result = self._recognizer.get_result(stream)
+        self._result = result.text.strip()
+        self._buffer = b""
+        return self._result
+
+
 def get_stt_backend(backend: str, model_path: str | None = None) -> STTBackend:
+    if backend == "whisper":
+        return WhisperSTT(model_path or _WHISPER_MODEL_PATH)
     if backend == "sherpa-onnx":
         return SherpaOnnxSTT(model_path or _SHERPA_MODEL_PATH)
     vosk_path = model_path or _MODEL_PATH
