@@ -110,7 +110,9 @@ class PipeWireInputCapture:
         if not parec:
             parec = shutil.which("pw-record")
             if not parec:
-                raise RuntimeError("Neither parec nor pw-record found -- cannot capture audio")
+                raise RuntimeError(
+                    "Neither parec nor pw-record found -- cannot capture audio"
+                )
 
         is_pw = "pw-record" in parec
         cmd = [
@@ -188,10 +190,11 @@ class PipeWireInputCapture:
 
 
 class PipeWireOutputPlayer:
-    """Play remote audio tracks through pw-play (native PipeWire client).
+    """Play remote audio tracks through pacat (PulseAudio stdin player).
 
     Replaces MediaDevices.open_output() -> OutputPlayer which uses PortAudio.
-    Spawns a single pw-play subprocess and pipes all incoming audio frames to its stdin.
+    Spawns a single pacat (or paplay) subprocess and pipes all incoming audio frames
+    to its stdin. Falls back through pacat → paplay.
     """
 
     def __init__(self, sample_rate: int, num_channels: int = 1):
@@ -203,17 +206,35 @@ class PipeWireOutputPlayer:
         self._stop = asyncio.Event()
 
     async def start(self):
-        pw_play = shutil.which("pw-play")
-        if not pw_play:
-            raise RuntimeError("pw-play not found -- cannot play audio")
-
-        self._proc = await asyncio.create_subprocess_exec(
-            pw_play, "--rate", str(self._sample_rate),
-            "--channels", str(self._num_channels),
-            "--format", "s16", "-",
-            stdin=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+        pacat = shutil.which("pacat")
+        if not pacat:
+            paplay = shutil.which("paplay")
+            if not paplay:
+                raise RuntimeError(
+                    "Neither pacat nor paplay found -- cannot play audio"
+                )
+            logger.info("PipeWireOutputPlayer: using paplay (fallback)")
+            self._proc = await asyncio.create_subprocess_exec(
+                paplay,
+                "--raw",
+                f"--rate={self._sample_rate}",
+                f"--channels={self._num_channels}",
+                "--format=s16le",
+                stdin=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        else:
+            logger.info("PipeWireOutputPlayer: using pacat")
+            self._proc = await asyncio.create_subprocess_exec(
+                pacat,
+                "--raw",
+                f"--rate={self._sample_rate}",
+                f"--channels={self._num_channels}",
+                "--format=s16le",
+                "--latency-msec=10",
+                stdin=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
         self._started = True
 
     async def add_track(self, track):
@@ -240,6 +261,19 @@ class PipeWireOutputPlayer:
         try:
             async for event in stream:
                 if self._stop.is_set() or not self._proc:
+                    break
+                if self._proc.returncode is not None:
+                    stderr = (
+                        (await self._proc.stderr.read()).decode(errors="replace")
+                        if self._proc.stderr
+                        else ""
+                    )
+                    logger.error(
+                        "Playback process exited (%d) for track %s: %s",
+                        self._proc.returncode,
+                        sid,
+                        stderr.strip(),
+                    )
                     break
                 if self._proc.stdin:
                     self._proc.stdin.write(event.frame.data.tobytes())
@@ -420,7 +454,9 @@ class LiveKitSessionManager:
             for p in self.room.remote_participants.values():
                 self.emit("participant_joined", {"identity": p.identity})
 
-            track = LocalAudioTrack.create_audio_track("microphone", self.capture.source)
+            track = LocalAudioTrack.create_audio_track(
+                "microphone", self.capture.source
+            )
             opts = TrackPublishOptions()
             opts.source = TrackSource.SOURCE_MICROPHONE
             await self.room.local_participant.publish_track(track, opts)
