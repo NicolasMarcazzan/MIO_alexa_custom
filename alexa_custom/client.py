@@ -8,10 +8,13 @@ from typing import Callable
 
 from livekit.api import AccessToken, VideoGrants
 import numpy as np
+import shutil
+
 from livekit.rtc import (
+    AudioFrame,
+    AudioSource,
     AudioStream,
     LocalAudioTrack,
-    MediaDevices,
     Room,
     TrackKind,
     TrackPublishOptions,
@@ -88,19 +91,198 @@ def browser_join_url(identity: str = "browser-user") -> str:
     return f"https://meet.livekit.io/custom/?{params}"
 
 
+class PipeWireInputCapture:
+    """Capture audio from the PipeWire default source via parec into a LiveKit AudioSource.
+
+    Replaces MediaDevices.open_input() which uses PortAudio (broken on ALSA->PipeWire shim).
+    """
+
+    def __init__(self, sample_rate: int, num_channels: int = 1):
+        self.source = AudioSource(sample_rate=sample_rate, num_channels=num_channels)
+        self._sample_rate = sample_rate
+        self._num_channels = num_channels
+        self._proc: asyncio.subprocess.Process | None = None
+        self._task: asyncio.Task | None = None
+        self._stop = asyncio.Event()
+
+    async def start(self):
+        parec = shutil.which("parec")
+        if not parec:
+            parec = shutil.which("pw-record")
+            if not parec:
+                raise RuntimeError("Neither parec nor pw-record found -- cannot capture audio")
+
+        is_pw = "pw-record" in parec
+        cmd = [
+            parec,
+            f"--rate={self._sample_rate}",
+            f"--channels={self._num_channels}",
+            "--format=s16le" if not is_pw else "--format=s16",
+        ]
+        if not is_pw:
+            cmd.append("--latency-msec=1")
+
+        self._proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+        self._task = asyncio.create_task(self._pump())
+
+    async def _pump(self):
+        assert self._proc is not None
+        assert self._proc.stdout is not None
+
+        frame_bytes = self._sample_rate * self._num_channels * 2 // 50  # ~20ms
+
+        while not self._stop.is_set():
+            try:
+                raw = await asyncio.wait_for(
+                    self._proc.stdout.read(frame_bytes), timeout=1.0
+                )
+                if not raw:
+                    break
+
+                sample_size = 2 * self._num_channels
+                raw = raw[: len(raw) // sample_size * sample_size]
+                if not raw:
+                    continue
+
+                samples_per_channel = len(raw) // sample_size
+                frame = AudioFrame(
+                    data=raw,
+                    sample_rate=self._sample_rate,
+                    num_channels=self._num_channels,
+                    samples_per_channel=samples_per_channel,
+                )
+                await self.source.capture_frame(frame)
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"PipeWire capture error: {e}")
+                break
+
+        if self._proc and self._proc.returncode is None:
+            self._proc.terminate()
+            try:
+                await self._proc.wait()
+            except Exception:
+                pass
+
+    async def aclose(self):
+        self._stop.set()
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        if self._proc and self._proc.returncode is None:
+            self._proc.terminate()
+            try:
+                await self._proc.wait()
+            except Exception:
+                pass
+        await self.source.aclose()
+
+
+class PipeWireOutputPlayer:
+    """Play remote audio tracks through pw-play (native PipeWire client).
+
+    Replaces MediaDevices.open_output() -> OutputPlayer which uses PortAudio.
+    Spawns a single pw-play subprocess and pipes all incoming audio frames to its stdin.
+    """
+
+    def __init__(self, sample_rate: int, num_channels: int = 1):
+        self._sample_rate = sample_rate
+        self._num_channels = num_channels
+        self._proc: asyncio.subprocess.Process | None = None
+        self._stream_tasks: dict[str, asyncio.Task] = {}
+        self._started = False
+        self._stop = asyncio.Event()
+
+    async def start(self):
+        pw_play = shutil.which("pw-play")
+        if not pw_play:
+            raise RuntimeError("pw-play not found -- cannot play audio")
+
+        self._proc = await asyncio.create_subprocess_exec(
+            pw_play, "--rate", str(self._sample_rate),
+            "--channels", str(self._num_channels),
+            "--format", "s16", "-",
+            stdin=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        self._started = True
+
+    async def add_track(self, track):
+        if not self._started:
+            return
+        stream = AudioStream(
+            track,
+            sample_rate=self._sample_rate,
+            num_channels=self._num_channels,
+        )
+        task = asyncio.create_task(self._play_stream(track.sid, stream))
+        self._stream_tasks[track.sid] = task
+
+    async def remove_track(self, track):
+        task = self._stream_tasks.pop(track.sid, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _play_stream(self, sid: str, stream: AudioStream):
+        try:
+            async for event in stream:
+                if self._stop.is_set() or not self._proc:
+                    break
+                if self._proc.stdin:
+                    self._proc.stdin.write(event.frame.data.tobytes())
+                    await self._proc.stdin.drain()
+        except Exception as e:
+            logger.error(f"Playback error for track {sid}: {e}")
+        finally:
+            await stream.aclose()
+
+    async def aclose(self):
+        self._stop.set()
+        for tid, task in list(self._stream_tasks.items()):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._stream_tasks.clear()
+        if self._proc:
+            if self._proc.stdin:
+                try:
+                    self._proc.stdin.close()
+                except Exception:
+                    pass
+            if self._proc.returncode is None:
+                try:
+                    self._proc.terminate()
+                    await self._proc.wait()
+                except Exception:
+                    pass
+
+
 class LiveKitSessionManager:
     """Manages a single LiveKit room session, track publishing, and player state."""
 
     def __init__(
         self,
-        mic,
-        devices: MediaDevices,
-        pw_device: int,
+        capture: PipeWireInputCapture,
+        samplerate: int,
         on_event: Callable[[str, dict], None] | None = None,
     ):
-        self.mic = mic
-        self.devices = devices
-        self.pw_device = pw_device
+        self.capture = capture
+        self.samplerate = samplerate
         self.on_event = on_event
         self.room = Room()
         self.disconnected = asyncio.Event()
@@ -215,10 +397,11 @@ class LiveKitSessionManager:
         """Connect to one LiveKit session; return when disconnected or stop_event fires."""
         empty_room_timeout = float(os.environ.get("EMPTY_ROOM_TIMEOUT", "0") or "0")
 
-        # Create a fresh player for this session to ensure clean state and avoid mixer timeouts
-        self.player = self.devices.open_output(output_device=self.pw_device)
+        self.player = PipeWireOutputPlayer(sample_rate=self.samplerate)
         await self.player.start()
         logger.debug("Session player started")
+
+        self.capture.source.clear_queue()
 
         try:
             room_url = require_env("LIVEKIT_URL")
@@ -237,7 +420,7 @@ class LiveKitSessionManager:
             for p in self.room.remote_participants.values():
                 self.emit("participant_joined", {"identity": p.identity})
 
-            track = LocalAudioTrack.create_audio_track("microphone", self.mic.source)
+            track = LocalAudioTrack.create_audio_track("microphone", self.capture.source)
             opts = TrackPublishOptions()
             opts.source = TrackSource.SOURCE_MICROPHONE
             await self.room.local_participant.publish_track(track, opts)
@@ -285,14 +468,13 @@ class LiveKitSessionManager:
 
 
 async def run_session(
-    mic,
-    devices: MediaDevices,
-    pw_device: int,
+    capture: PipeWireInputCapture,
+    samplerate: int,
     stop_event: asyncio.Event,
     on_event: Callable[[str, dict], None] | None = None,
 ):
     """Connect to one LiveKit session; return when disconnected or stop_event fires."""
-    manager = LiveKitSessionManager(mic, devices, pw_device, on_event)
+    manager = LiveKitSessionManager(capture, samplerate, on_event)
     await manager.run(stop_event)
 
 
@@ -387,9 +569,9 @@ async def _async_main(
         samplerate = 16000
         logger.info("Bluetooth detected — using 16kHz sample rate for session")
 
-    devices = MediaDevices(
-        input_sample_rate=samplerate, output_sample_rate=samplerate, num_channels=1
-    )
+    logger.info(f"LiveKit capture via parec (rate={samplerate})")
+    capture = PipeWireInputCapture(sample_rate=samplerate, num_channels=1)
+    await capture.start()
 
     # Use the provided stop event (TUI mode) or create one and wire signals.
     stop_event = ext_stop_event or asyncio.Event()
@@ -397,29 +579,6 @@ async def _async_main(
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop_event.set)
-
-    def _flag(key: str, default: bool = True) -> bool:
-        return os.environ.get(key, "1" if default else "0").strip().lower() not in (
-            "0",
-            "false",
-            "no",
-        )
-
-    agc = _flag("MIC_AGC")
-    aec = _flag("MIC_AEC")
-    ns = _flag("MIC_NOISE_SUPPRESSION")
-    hpf = _flag("MIC_HIGH_PASS_FILTER")
-    logger.info(
-        f"Opening microphone (AEC={aec} NS={ns} HPF={hpf} AGC={agc} rate={samplerate})..."
-    )
-    mic = devices.open_input(
-        enable_aec=aec,
-        noise_suppression=ns,
-        high_pass_filter=hpf,
-        auto_gain_control=agc,
-        input_device=pw_device,
-        queue_capacity=200,
-    )
 
     def _wrapped_on_event(event: str, data: dict) -> None:
         if livekit_connected_flag is not None:
@@ -457,9 +616,8 @@ async def _async_main(
 
             try:
                 await run_session(
-                    mic,
-                    devices,
-                    pw_device,
+                    capture,
+                    samplerate,
                     stop_event,
                     on_event=_on_event_interceptor,
                 )
@@ -490,7 +648,7 @@ async def _async_main(
                 pass
     finally:
         logger.info("Shutting down LiveKit loop...")
-        await mic.aclose()
+        await capture.aclose()
         logger.info("Done.")
 
 
