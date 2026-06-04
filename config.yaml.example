@@ -68,6 +68,11 @@ env:
   #MQTT_TOPIC_PREFIX: alexa
   #MQTT_NODE_ID: living_room   # defaults to system hostname
 
+  # --- Weather ---
+  # Default location when no city is specified (lat/lon). Omit to use GeoIP.
+  #WEATHER_LAT: 45.4384
+  #WEATHER_LON: 10.9916
+
 # ---------------------------------------------------------------------------
 # web: — browser dashboard (optional)
 # ---------------------------------------------------------------------------
@@ -86,42 +91,18 @@ env:
 # If a group defines no triggers, the global top-level triggers list is used.
 
 wake_words:
-  - word: "galileo"
+  - word: "megatron"
     aliases:
-      - "ehi galileo"       # alternative recognition phrase for the same group
-    triggers:               # commands active only after this wake word
-      - phrase: "chiama Stefano"
-        actions:
-          - type: ask
-            text: "Vuoi chiamare Alessandro?"
-            lang: "it-IT"   # BCP-47 language tag for TTS (default: it-IT)
-            timeout: 5.0    # seconds to wait for a reply
-            on_reply:
-              - phrase: "si"
-                actions:
-                  - type: say
-                    text: "Sto chiamando Alessandro"
-                  - type: livekit_join
-                  - type: telegram
-                    text: "Collegati con casa <room>"
-                    # chat_id: "12345678"  # overrides TELEGRAM_CHAT_ID env var
-              - phrase: "no"
-                actions:
-                  - type: say
-                    text: "Chiamata annullata"
-            on_else:        # actions when no reply phrase matches (or timeout)
-              - type: say
-                text: "Non ho capito"
+      - "ehi megatron"       # alternative recognition phrase for the same group
 
-  # This group has no per-group triggers — falls back to the global list below.
-  - word: "assistente"
+  - word: "jarvis"
 
 # ---------------------------------------------------------------------------
 # Recognition settings
 # ---------------------------------------------------------------------------
 
 # How long to listen for a command after the wake word (seconds, two-stage only).
-command_timeout: 3.0
+command_timeout: 5.0
 
 # Recognition mode:
 #   two-stage    — low CPU; wake word detected first, then a timed window opens
@@ -229,6 +210,30 @@ triggers:
     actions:
       - type: livekit_join
 
+  # --- chiama: ask confirmation then call via livekit_join ---
+  - phrase: "chiama Stefano"
+    actions:
+      - type: ask
+        text: "Vuoi chiamare?"
+        lang: "it-IT"
+        timeout: 5.0
+        on_reply:
+          - phrase: "si"
+            actions:
+              - type: say
+                text: "Sto chiamando Stefano"
+              - type: livekit_join
+              - type: telegram
+                text: "Collegati con casa <room>"
+                # chat_id: "12345678"
+          - phrase: "no"
+            actions:
+              - type: say
+                text: "Chiamata annullata"
+        on_else:
+          - type: say
+            text: "Non ho capito"
+
   # --- telegram: send a Telegram message ---
   - phrase: "manda messaggio"
     actions:
@@ -261,3 +266,70 @@ triggers:
         on_else:
           - type: tone
             name: error
+
+  # --- weather: forecast for known cities (exact match) ---
+  - phrase: "che tempo fa a Verona"
+    actions:
+      - type: weather
+        city: Verona
+
+  - phrase: "che tempo fa a San Giovanni Lupatoto"
+    actions:
+      - type: weather
+        city: San Giovanni Lupatoto
+
+  - phrase: "che tempo fa a Montorio"
+    actions:
+      - type: weather
+        city: Montorio
+
+  # --- weather: generic with {city} variable extracted from speech ---
+  # The {city} placeholder is auto-extracted from what the user says.
+  - phrase: "che tempo fa a {city}"
+    actions:
+      - type: weather
+
+  # --- weather: no city specified — uses default location or GeoIP ---
+  - phrase: "che tempo fa"
+    actions:
+      - type: weather
+
+  # --- weather: future days ---
+  - phrase: "che tempo fa domani"
+    actions:
+      - type: weather
+  - phrase: "che tempo fa dopodomani"
+    actions:
+      - type: weather
+  - phrase: "che tempo fa tra {n} giorni"
+    actions:
+      - type: weather
+  - phrase: "che tempo fa {day}"
+    actions:
+      - type: weather
+
+  - phrase: "com'è il meteo"
+    actions:
+      - type: weather
+  - phrase: "com'è il meteo oggi"
+    actions:
+      - type: weather
+  - phrase: "com'è il meteo {day}"
+    actions:
+      - type: weather
+
+  # --- date ---
+  - phrase: "che giorno è"
+    actions:
+      - type: date
+  - phrase: "che giorno è oggi"
+    actions:
+      - type: date
+
+  # --- time ---
+  - phrase: "che ora è"
+    actions:
+      - type: time
+  - phrase: "che ore sono"
+    actions:
+      - type: time

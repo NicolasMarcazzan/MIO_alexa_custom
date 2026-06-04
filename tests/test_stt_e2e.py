@@ -111,9 +111,9 @@ class TestSherpaOnnxSTT:
         The assertion only checks that endpoint detection is working (non-empty
         output), not that the exact words are transcribed.
         """
-        pcm = _synth_to_pcm("ehi galileo")
+        pcm = _synth_to_pcm("ehi megatron")
         result = _feed_pcm(self.backend, pcm)
-        assert result, f"No text recognised from 'ehi galileo' (got: {result!r})"
+        assert result, f"No text recognised from 'ehi megatron' (got: {result!r})"
 
     def test_command_recognised(self):
         pcm = _synth_to_pcm("chiama stefano")
@@ -122,12 +122,12 @@ class TestSherpaOnnxSTT:
 
     def test_full_conversation_phrase(self):
         """Simulate a single-phrase wake+command as used in single-stage mode."""
-        pcm = _synth_to_pcm("ehi galileo chiama stefano")
+        pcm = _synth_to_pcm("ehi megatron chiama stefano")
         result = _feed_pcm(self.backend, pcm)
         assert result, f"No text recognised (got: {result!r})"
         # longer phrase gives better accuracy — check for at least one key word
         low = result.lower()
-        assert any(w in low for w in ("galileo", "chiama", "stefano")), (
+        assert any(w in low for w in ("megatron", "chiama", "stefano")), (
             f"No key word found in {result!r}"
         )
 
@@ -147,9 +147,9 @@ class TestVoskSTT:
         In production, Vosk uses a grammar-constrained KaldiRecognizer so wake words
         are the only accepted tokens.
         """
-        pcm = _synth_to_pcm("ehi galileo")
+        pcm = _synth_to_pcm("ehi megatron")
         result = _feed_pcm(self.backend, pcm)
-        assert result, f"No text recognised from 'ehi galileo' (got: {result!r})"
+        assert result, f"No text recognised from 'ehi megatron' (got: {result!r})"
 
     def test_command_recognised(self):
         pcm = _synth_to_pcm("chiama stefano")
@@ -169,17 +169,17 @@ def _make_alias_map(phrases: list[str]) -> dict:
 
 class TestApproxWakeMatch:
     def setup_method(self):
-        self.alias_map = _make_alias_map(["ehi galileo"])
+        self.alias_map = _make_alias_map(["ehi megatron"])
 
     def test_exact_match(self):
-        assert _approx_wake_match("ehi galileo", self.alias_map) is not None
+        assert _approx_wake_match("ehi megatron", self.alias_map) is not None
 
     def test_noisy_transcript(self):
-        # sherpa often adds "e il" instead of "ehi" but preserves "galileo"
-        assert _approx_wake_match("e il galileo", self.alias_map) is not None
+        # sherpa often adds "e il" instead of "ehi" but preserves "megatron"
+        assert _approx_wake_match("e il megatron", self.alias_map) is not None
 
     def test_partial_transcript(self):
-        assert _approx_wake_match("galileo", self.alias_map) is not None
+        assert _approx_wake_match("megatron", self.alias_map) is not None
 
     def test_no_match(self):
         assert _approx_wake_match("buongiorno come stai", self.alias_map) is None

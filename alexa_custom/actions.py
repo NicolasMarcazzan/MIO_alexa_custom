@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import logging
+import re
 import os
 import unicodedata
 from typing import Awaitable, Callable, TYPE_CHECKING
@@ -48,25 +49,63 @@ class TelegramClient:
     # Future: async def start_polling(self, handler) -> None: ...
 
 
+def _has_vars(pattern: str) -> bool:
+    return "{" in pattern and "}" in pattern
+
+
+def _pattern_to_regex(pattern: str) -> tuple[re.Pattern, list[str]]:
+    """Convert 'che tempo fa a {city}' to regex with named groups."""
+    var_names: list[str] = []
+    parts = re.split(r"\{(\w+)\}", pattern)
+    regex_parts: list[str] = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            var_names.append(part)
+            regex_parts.append(r"(.+)")
+        else:
+            if part:
+                regex_parts.append(re.escape(normalize_text(part)))
+    regex_str = "^" + "".join(regex_parts) + "$"
+    return re.compile(regex_str, re.IGNORECASE), var_names
+
+
 def match_trigger(
     transcript: str,
     triggers: list[Trigger],
     threshold: float = 0.70,
-) -> Trigger | None:
+) -> tuple[Trigger | None, dict]:
     best: Trigger | None = None
     best_score = 0.0
+    best_vars: dict = {}
     t_norm = normalize_text(transcript)
     for trigger in triggers:
-        p_norm = normalize_text(trigger.phrase)
-        score = difflib.SequenceMatcher(None, t_norm, p_norm).ratio()
-        if score > best_score:
-            best_score = score
-            best = trigger
+        if _has_vars(trigger.phrase):
+            try:
+                regex, var_names = _pattern_to_regex(trigger.phrase)
+                m = regex.match(t_norm)
+                if m:
+                    vars_found = {
+                        name: m.group(i + 1).strip() for i, name in enumerate(var_names)
+                    }
+                    logger.info(
+                        f"Matched trigger '{trigger.phrase}' with vars={vars_found}"
+                    )
+                    return trigger, vars_found
+            except re.error:
+                logger.warning(f"Invalid pattern in trigger: {trigger.phrase}")
+                continue
+        else:
+            p_norm = normalize_text(trigger.phrase)
+            score = difflib.SequenceMatcher(None, t_norm, p_norm).ratio()
+            if score > best_score:
+                best_score = score
+                best = trigger
+                best_vars = {}
     if best is not None and best_score >= threshold:
         logger.info(f"Matched trigger '{best.phrase}' (score={best_score:.2f})")
-        return best
+        return best, best_vars
     logger.debug(f"No trigger matched '{transcript}' (best score={best_score:.2f})")
-    return None
+    return None, {}
 
 
 async def dispatch(
@@ -77,10 +116,21 @@ async def dispatch(
     listen_fn: Callable[[float], Awaitable[str]] | None = None,
     mqtt_client: MQTTClient | None = None,
     on_stt_event: Callable[[str, dict], None] | None = None,
+    trigger_vars: dict | None = None,
 ) -> None:
     for action in trigger.actions:
+        if trigger_vars:
+            merged_params = {**action.params, "_trigger_vars": trigger_vars}
+        else:
+            merged_params = action.params
+        merged_action = ActionEntry(
+            type=action.type,
+            params=merged_params,
+            on_reply=action.on_reply,
+            on_else=action.on_else,
+        )
         await _run_action(
-            action,
+            merged_action,
             telegram_client,
             livekit_connect_fn,
             livekit_connected,
@@ -231,7 +281,7 @@ async def handle_ask(
 
     transcript = await listen_task
     if transcript:
-        reply_trigger = match_trigger(transcript, action.on_reply)
+        reply_trigger, _reply_vars = match_trigger(transcript, action.on_reply)
         if reply_trigger:
             logger.info(f"Matched reply trigger: '{reply_trigger.phrase}'")
             if on_stt_event:
@@ -331,6 +381,105 @@ async def handle_mqtt_publish(action: ActionEntry, mqtt_client: MQTTClient | Non
         logger.error("mqtt_publish action: no topic provided")
         return
     await mqtt_client.publish(topic, payload, retain=retain)
+
+
+@registry.register("weather")
+async def handle_weather(action: ActionEntry, **_):
+    import os
+    from alexa_custom.weather import (
+        geocode,
+        geolocate_ip,
+        get_forecast,
+        format_forecast,
+        check_warnings,
+        _parse_day,
+    )
+    from alexa_custom.tts import get_engine
+
+    trigger_vars = action.params.get("_trigger_vars", {})
+    city = trigger_vars.get("city") or action.params.get("city")
+    day = trigger_vars.get("day") or action.params.get("day")
+    n = trigger_vars.get("n") or action.params.get("n")
+    day_offset = action.params.get("day_offset")
+
+    if n is not None:
+        day_offset = _parse_day(n)
+    elif day is not None:
+        day_offset = _parse_day(day)
+    elif day_offset is None:
+        day_offset = 0
+
+    try:
+        if city:
+            lat, lon, display = await geocode(city)
+        else:
+            try:
+                lat, lon, display = await geolocate_ip()
+            except Exception:
+                lat_str = os.environ.get("WEATHER_LAT")
+                lon_str = os.environ.get("WEATHER_LON")
+                if lat_str and lon_str:
+                    lat, lon = float(lat_str), float(lon_str)
+                    display = "casa"
+                else:
+                    raise
+
+        forecast = await get_forecast(lat, lon, days=day_offset + 2)
+        text = format_forecast(display, forecast, day_offset)
+        alert, info = check_warnings(forecast, day_offset)
+        if alert:
+            text += ". " + alert
+        if info:
+            text += ". " + info
+        logger.info(f"Weather: {text}")
+        await asyncio.to_thread(get_engine().say, text, "it-IT")
+    except Exception as e:
+        logger.error(f"Weather action failed: {e}")
+        await asyncio.to_thread(
+            get_engine().say,
+            "Non ho trovato il meteo per questa localit\u00e0",
+            "it-IT",
+        )
+
+
+@registry.register("date")
+async def handle_date(action: ActionEntry, **_):
+    from alexa_custom.weather import today_date_text
+    from alexa_custom.tts import get_engine
+
+    text = today_date_text()
+    logger.info(f"Date: {text}")
+    await asyncio.to_thread(get_engine().say, text, "it-IT")
+
+
+@registry.register("time")
+async def handle_time(action: ActionEntry, **_):
+    from datetime import datetime
+    from alexa_custom.weather import today_date_text
+    from alexa_custom.tts import get_engine
+
+    now = datetime.now()
+    h, m = now.hour, now.minute
+    if h == 1 or h == 13:
+        hour_text = "l'una"
+    else:
+        hour_text = f"le {h}"
+    if m == 0:
+        time_part = hour_text
+    elif m == 1:
+        time_part = f"{hour_text} e un minuto"
+    elif m == 15:
+        time_part = f"{hour_text} e un quarto"
+    elif m == 30:
+        time_part = f"{hour_text} e mezza"
+    elif m == 45:
+        time_part = f"{hour_text} e tre quarti"
+    else:
+        time_part = f"{hour_text} e {m}"
+    date_part = today_date_text(now.date())
+    text = f"Sono {time_part}. {date_part}"
+    logger.info(f"Time: {text}")
+    await asyncio.to_thread(get_engine().say, text, "it-IT")
 
 
 async def _run_action(
