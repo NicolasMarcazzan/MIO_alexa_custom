@@ -2,82 +2,70 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Callable
-
-if TYPE_CHECKING:
-    from alexa_custom.config import LLMConfig
+from threading import Lock
 
 logger = logging.getLogger(__name__)
 
 
 class LLMEngine:
-    def __init__(self, get_llm_config: Callable[[], LLMConfig | None]) -> None:
-        self._get_llm_config = get_llm_config
-        self._llm = None
-        self._loaded_model_path: str | None = None
+    def __init__(
+        self,
+        model_path: str,
+        system_prompt: str = "Sei un assistente vocale casalingo. Rispondi in modo breve e conciso, massimo 3 frasi. Rispondi in italiano.",
+        max_tokens: int = 128,
+        temperature: float = 0.7,
+    ):
+        self._model_path = model_path
+        self._system_prompt = system_prompt
+        self._max_tokens = max_tokens
+        self._temperature = temperature
+        self._model = None
+        self._lock = Lock()
 
-    def _init_model(self) -> None:
-        if self._llm is not None:
-            # Check if model path has changed
-            config = self._get_llm_config()
-            if config and config.model_path == self._loaded_model_path:
-                return
-
-        config = self._get_llm_config()
-        if not config or not config.enabled:
+    def _lazy_init(self):
+        if self._model is not None:
             return
+        with self._lock:
+            if self._model is not None:
+                return
+            try:
+                from llama_cpp import Llama
+            except ImportError:
+                raise RuntimeError(
+                    "llama-cpp-python not installed. Run: pip install llama-cpp-python"
+                )
+            logger.info(f"Loading LLM model from {self._model_path}")
+            self._model = Llama(
+                model_path=self._model_path,
+                n_ctx=512,
+                n_threads=4,
+                verbose=False,
+            )
+            logger.info("LLM model loaded")
 
-        logger.info(f"Initializing LLM model from {config.model_path}")
+    def generate(
+        self, text: str, max_tokens: int | None = None, temperature: float | None = None
+    ) -> str:
+        self._lazy_init()
         try:
-            from llama_cpp import Llama
-        except ImportError:
-            raise ImportError(
-                "The 'llama-cpp-python' package is required for local LLM features, but it is not installed. "
-                "You can install it manually using 'pip install llama-cpp-python' or install this project "
-                "with the LLM optional dependencies: 'pip install -e .[llm]'"
+            prompt = (
+                f"<|im_start|>system\n{self._system_prompt}<|im_end|>\n"
+                f"<|im_start|>user\n{text}<|im_end|>\n"
+                f"<|im_start|>assistant\n"
             )
-        import os
-
-        if not os.path.exists(config.model_path):
-            raise FileNotFoundError(
-                f"LLM model not found at {config.model_path}. "
-                f"Run 'alexa-setup --llm' to download it."
+            response = self._model.create_completion(
+                prompt=prompt,
+                max_tokens=max_tokens or self._max_tokens,
+                temperature=temperature or self._temperature,
+                stop=["<|im_end|>", "<|im_start|>"],
             )
+            content = response["choices"][0]["text"].strip()
+            return content
+        except Exception as e:
+            logger.error(f"LLM generation failed: {e}")
+            return ""
 
-        # Clean up old engine instance if model path changed
-        if self._llm is not None:
-            self._llm = None
-
-        self._llm = Llama(
-            model_path=str(config.model_path),
-            n_ctx=512,  # Short context is sufficient for voice Q&A
-            n_threads=4,  # Optimized for the Snapdragon 801 CPU cores
-            verbose=False,
-        )
-        self._loaded_model_path = config.model_path
-
-    async def generate(self, text: str) -> str:
-        """Asynchronously generate a response using llama-cpp-python."""
-        # Ensure the model is initialized inside a background thread to prevent blocking the event loop
-        await asyncio.to_thread(self._init_model)
-
-        if self._llm is None:
-            raise RuntimeError("LLM engine model is not loaded.")
-
-        def _sync_generate() -> str:
-            config = self._get_llm_config()
-            if not config:
-                raise RuntimeError("LLM configuration is missing.")
-
-            messages = [
-                {"role": "system", "content": config.system_prompt},
-                {"role": "user", "content": text},
-            ]
-            response = self._llm.create_chat_completion(
-                messages=messages,
-                max_tokens=config.max_tokens,
-                temperature=config.temperature,
-            )
-            return response["choices"][0]["message"]["content"].strip()
-
-        return await asyncio.to_thread(_sync_generate)
+    async def async_generate(
+        self, text: str, max_tokens: int | None = None, temperature: float | None = None
+    ) -> str:
+        return await asyncio.to_thread(self.generate, text, max_tokens, temperature)

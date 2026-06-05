@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 from alexa_custom.actions import TelegramClient, dispatch, match_trigger
 from alexa_custom.audio import is_playback_active, play_timeout_beep, play_wake_beep
 from alexa_custom.config import ActionsConfig, Trigger, WakeWordGroup
+from alexa_custom.llm import LLMEngine
 
 logger = logging.getLogger(__name__)
 
@@ -544,6 +545,9 @@ def run_stt_worker(
         return
     backend_key = (current_config.stt_backend, current_config.stt_model_path)
 
+    llm_engine: LLMEngine | None = None
+    llm_engine_key: tuple[str, str] | None = None
+
     _dispatch_loop = asyncio.new_event_loop()
     try:
         while not stop_event.is_set():
@@ -569,6 +573,28 @@ def run_stt_worker(
                     logger.error(f"STT backend reload failed: {e}")
                     time.sleep(2)
                     continue
+
+            # Reload LLM engine when config changes
+            new_llm_key: tuple[str, str] | None = None
+            llm_cfg = current_config.llm
+            if llm_cfg and llm_cfg.enabled and llm_cfg.model_path:
+                new_llm_key = (llm_cfg.model_path, llm_cfg.system_prompt)
+            if new_llm_key != llm_engine_key:
+                llm_engine = None
+                llm_engine_key = new_llm_key
+                if new_llm_key is not None:
+                    try:
+                        llm_engine = LLMEngine(
+                            model_path=llm_cfg.model_path,
+                            system_prompt=llm_cfg.system_prompt,
+                            max_tokens=llm_cfg.max_tokens,
+                            temperature=llm_cfg.temperature,
+                        )
+                        logger.info(f"LLM engine created (model: {llm_cfg.model_path})")
+                    except Exception as e:
+                        logger.error(f"LLM engine creation failed: {e}")
+                else:
+                    logger.info("LLM engine disabled via config")
             proc: subprocess.Popen | None = None
             try:
                 proc = start_capture(source, channels)
@@ -588,6 +614,7 @@ def run_stt_worker(
                     mqtt_client=mqtt_client,
                     loop=loop,
                     dispatch_loop=_dispatch_loop,
+                    llm_engine=llm_engine,
                 )
             except Exception as e:
                 logger.error(f"STT error: {e}")
@@ -764,6 +791,7 @@ def _single_stage_loop(
     mqtt_client: "MQTTClient | None" = None,
     loop: asyncio.AbstractEventLoop | None = None,
     dispatch_loop: asyncio.AbstractEventLoop | None = None,
+    llm_engine: LLMEngine | None = None,
 ) -> None:
     """Single-stage: full transcription always; wake word + command in one phrase."""
     cooldown_until = 0.0
@@ -889,7 +917,10 @@ def _single_stage_loop(
         if trigger is None:
             if on_stt_event:
                 on_stt_event("nomatch", {"transcript": command})
-            _play_timeout()
+            if llm_engine is not None:
+                _speak_llm_reply(llm_engine, command, dispatch_loop, on_stt_event)
+            else:
+                _play_timeout()
             continue
 
         if on_stt_event:
@@ -935,6 +966,7 @@ def _recognition_loop(
     mqtt_client: MQTTClient | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
     dispatch_loop: asyncio.AbstractEventLoop | None = None,
+    llm_engine: LLMEngine | None = None,
 ) -> None:
     alias_map = _build_alias_map(config.wake_words)
     is_vosk = isinstance(backend, VoskSTT)
@@ -1071,6 +1103,7 @@ def _recognition_loop(
                         mqtt_client=mqtt_client,
                         loop=loop,
                         dispatch_loop=dispatch_loop,
+                        llm_engine=llm_engine,
                     )
                     logger.debug(
                         f"two-stage: dispatch returned — livekit_flag={livekit_connected_flag.is_set()} "
@@ -1154,6 +1187,7 @@ def _recognition_loop(
                             mqtt_client=mqtt_client,
                             loop=loop,
                             dispatch_loop=dispatch_loop,
+                            llm_engine=llm_engine,
                         )
                         _drain_pipe(proc)
                         stage1_last_speech_t = 0.0
@@ -1189,6 +1223,7 @@ def _wake_detected(
     mqtt_client: MQTTClient | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
     dispatch_loop: asyncio.AbstractEventLoop | None = None,
+    llm_engine: LLMEngine | None = None,
 ) -> None:
     logger.info(f"Wake word detected: '{wake_group.word}'")
     if on_stt_event:
@@ -1238,7 +1273,10 @@ def _wake_detected(
     if trigger is None:
         if on_stt_event:
             on_stt_event("nomatch", {"transcript": transcript})
-        _play_timeout()
+        if llm_engine is not None:
+            _speak_llm_reply(llm_engine, transcript, dispatch_loop, on_stt_event)
+        else:
+            _play_timeout()
         return
 
     if on_stt_event:
@@ -1283,6 +1321,36 @@ def _wake_detected(
         )
     except Exception as e:
         logger.error(f"Action dispatch failed: {e}")
+
+
+def _speak_llm_reply(
+    llm_engine: LLMEngine,
+    transcript: str,
+    dispatch_loop: asyncio.AbstractEventLoop | None,
+    on_stt_event: Callable[[str, dict], None] | None = None,
+) -> None:
+    logger.info(f"LLM fallback for: '{transcript}'")
+    if on_stt_event:
+        on_stt_event("llm_query", {"transcript": transcript})
+    try:
+        from alexa_custom.tts import get_engine
+
+        reply = llm_engine.generate(transcript)
+        if reply:
+            logger.info(f"LLM reply: '{reply}'")
+            if on_stt_event:
+                on_stt_event("llm_reply", {"text": reply})
+            _dloop = dispatch_loop or asyncio.new_event_loop()
+            _dloop.run_until_complete(asyncio.to_thread(get_engine().say, reply))
+        else:
+            if on_stt_event:
+                on_stt_event("nomatch", {"transcript": transcript})
+            _play_timeout()
+    except Exception as e:
+        logger.error(f"LLM reply failed: {e}")
+        if on_stt_event:
+            on_stt_event("nomatch", {"transcript": transcript})
+        _play_timeout()
 
 
 def _play_timeout() -> None:

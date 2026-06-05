@@ -5,3 +5,6 @@ __pycache__/
 .venv/
 *.egg-info/
 models/
+
+.aider*
+graphify-out/
