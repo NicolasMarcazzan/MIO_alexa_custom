@@ -632,7 +632,7 @@ def _extract_wake_command(
     """
     norm_text = normalize_text(text)
     for norm_phrase, group in alias_map.items():
-        if norm_text.startswith(norm_phrase):
+        if norm_phrase in norm_text:
             command = text.lower().replace(norm_phrase, "", 1).strip()
             return group, command
     if fuzzy:
@@ -922,20 +922,17 @@ def _single_stage_loop(
             _play_timeout()
             continue
 
-        if command and len(command.split()) <= 1:
-            if on_stt_event:
-                on_stt_event("nomatch", {"transcript": command})
-            from alexa_custom.tts import get_engine
-
-            get_engine().say("Non ho capito", "it-IT")
-            cooldown_until = time.monotonic() + 2.0
-            continue
-
         triggers = _resolve_triggers(wake_group, config.triggers)
         trigger, trigger_vars = match_trigger(command, triggers)
         if trigger is None:
             if on_stt_event:
                 on_stt_event("nomatch", {"transcript": command})
+            if len(command.split()) <= 1:
+                from alexa_custom.tts import get_engine
+
+                get_engine().say("Non ho capito", "it-IT")
+                cooldown_until = time.monotonic() + 2.0
+                continue
             if any(kw in command.lower() for kw in _SKIP_LLM_KEYWORDS):
                 logger.info(
                     f"Timer/sveglia keyword in '{command}' — forcing timer_status, skipping LLM"
@@ -1126,8 +1123,7 @@ def _recognition_loop(
                 words = result.get("result", [])
                 conf = words[0].get("conf", 0.0) if words else 0.0
                 logger.debug(f"Stage1 result: {text!r} conf={conf:.2f}")
-                norm_text = normalize_text(text)
-                wake_match = alias_map.get(norm_text)
+                wake_match = _approx_wake_match(text, alias_map)
                 if wake_match is not None and conf >= config.wake_confidence:
                     _wake_detected(
                         wake_group=wake_match,
@@ -1296,22 +1292,19 @@ def _wake_detected(
         _play_timeout()
         return
 
-    if transcript and len(transcript.split()) <= 1:
-        logger.info(
-            f"Short command ({len(transcript.split())} words) — 'non ho capito'"
-        )
-        if on_stt_event:
-            on_stt_event("nomatch", {"transcript": transcript})
-        from alexa_custom.tts import get_engine
-
-        get_engine().say("Non ho capito", "it-IT")
-        return
-
     triggers = _resolve_triggers(wake_group, config.triggers)
     trigger, trigger_vars = match_trigger(transcript, triggers)
     if trigger is None:
         if on_stt_event:
             on_stt_event("nomatch", {"transcript": transcript})
+        if len(transcript.split()) <= 1:
+            logger.info(
+                f"Short command ({len(transcript.split())} words) — 'non ho capito'"
+            )
+            from alexa_custom.tts import get_engine
+
+            get_engine().say("Non ho capito", "it-IT")
+            return
         if any(kw in transcript.lower() for kw in _SKIP_LLM_KEYWORDS):
             logger.info(
                 f"Timer/sveglia keyword in '{transcript}' — forcing timer_status, skipping LLM"
@@ -1459,7 +1452,8 @@ def _llm_fallback(
                     logger.info("Wikipedia found context — answering with LLM")
                     return await _llm_engine.generate(f"{ctx}\n\nDomanda: {corrected}")
 
-            return await _llm_engine.generate(corrected)
+            instruction = "Rispondi in modo naturale e colloquiale in italiano."
+            return await _llm_engine.generate(f"{instruction}\n\nDomanda: {corrected}")
 
         response = _dloop.run_until_complete(_run())
         if response is True:

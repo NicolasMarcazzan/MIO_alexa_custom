@@ -110,7 +110,7 @@ command_timeout: 5.0
 recognition_mode: two-stage
 
 # Vosk confidence threshold (0.0–1.0) to accept a wake word in two-stage mode.
-wake_confidence: 0.65
+wake_confidence: 0.90
 
 # Tone name to play when a wake word is matched.
 # Available names: wake, startup, success, error, info, warning (or 'none' to disable)
@@ -403,3 +403,104 @@ triggers:
   - phrase: "che ore sono"
     actions:
       - type: time
+
+  # --- saluti / cortesia (offline, no LLM, no internet) ---
+  - phrase: "ciao"
+    actions:
+      - type: say
+        text: "Ciao! Come posso aiutarti?"
+        lang: "it-IT"
+  - phrase: "salve"
+    actions:
+      - type: say
+        text: "Salve! Piacere di sentirti."
+        lang: "it-IT"
+  - phrase: "buongiorno"
+    actions:
+      - type: say
+        text: "Buongiorno!"
+        lang: "it-IT"
+  - phrase: "buonasera"
+    actions:
+      - type: say
+        text: "Buonasera!"
+        lang: "it-IT"
+  - phrase: "grazie"
+    actions:
+      - type: say
+        text: "Prego!"
+        lang: "it-IT"
+  - phrase: "grazie mille"
+    actions:
+      - type: say
+        text: "Di niente!"
+        lang: "it-IT"
+  - phrase: "ok grazie"
+    actions:
+      - type: say
+        text: "Di niente!"
+        lang: "it-IT"
+
+  # --- identità (offline, no LLM) ---
+  - phrase: "chi sei"
+    actions:
+      - type: say
+        text: "Sono il tuo assistente vocale personale."
+        lang: "it-IT"
+  - phrase: "presentati"
+    actions:
+      - type: say
+        text: "Ciao, sono il tuo assistente vocale. Posso rispondere a domande, darti l'ora, il meteo, gestire timer e molto altro."
+        lang: "it-IT"
+  - phrase: "cosa sai fare"
+    actions:
+      - type: say
+        text: "So darti l'ora e la data, il meteo, gestire timer, accendere luci, chiamare, mandare messaggi e rispondere a domande di cultura generale."
+        lang: "it-IT"
+  - phrase: "che cosa sai fare"
+    actions:
+      - type: say
+        text: "So darti l'ora e la data, il meteo, gestire timer, accendere luci, chiamare, mandare messaggi e rispondere a domande di cultura generale."
+        lang: "it-IT"
+
+  # --- interiezioni (offline, no LLM) ---
+  - phrase: "bello"
+    actions:
+      - type: say
+        text: "Sono contento che ti piaccia!"
+        lang: "it-IT"
+  - phrase: "bellissimo"
+    actions:
+      - type: say
+        text: "Sono contento che ti piaccia!"
+        lang: "it-IT"
+  - phrase: "che noia"
+    actions:
+      - type: say
+        text: "Mi dispiace, cercherò di fare meglio."
+        lang: "it-IT"
+  - phrase: "noioso"
+    actions:
+      - type: say
+        text: "Mi dispiace, cercherò di fare meglio."
+        lang: "it-IT"
+  - phrase: "c'è nessuno"
+    actions:
+      - type: say
+        text: "Sì, sono qui!"
+        lang: "it-IT"
+  - phrase: "ok"
+    actions:
+      - type: say
+        text: "Ok!"
+        lang: "it-IT"
+  - phrase: "va bene"
+    actions:
+      - type: say
+        text: "Va bene!"
+        lang: "it-IT"
+  - phrase: "perfetto"
+    actions:
+      - type: say
+        text: "Perfetto!"
+        lang: "it-IT"
