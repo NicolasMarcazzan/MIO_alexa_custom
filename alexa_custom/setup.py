@@ -149,7 +149,8 @@ def _progress(count: int, block_size: int, total: int) -> None:
         return
     pct = min(100, count * block_size * 100 // total)
     filled = pct // 2
-    print(f"\r  [{'█' * filled}{'░' * (50 - filled)}] {pct:3d}%", end="", flush=True)
+    bar = "#" * filled + "." * (50 - filled)
+    print(f"\r  [{bar}] {pct:3d}%", end="", flush=True)
 
 
 def _download(url: str, dest: Path) -> None:
@@ -227,6 +228,40 @@ def download_piper_voice(voice: str, force: bool = False) -> None:
     print(f"Piper voice ready at {onnx_dest.resolve()}")
 
 
+_LLM_MODELS = {
+    "0.5b": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    "1.5b": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+}
+_LLM_DEST_DIR = Path("models/llm")
+
+
+def download_llm(tag: str = "1.5b", force: bool = False) -> None:
+    if tag not in _LLM_MODELS:
+        print(
+            f"Unknown LLM size {tag!r}. Available: {', '.join(sorted(_LLM_MODELS))}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    url = _LLM_MODELS[tag]
+    filename = url.rstrip("/").split("/")[-1]
+    dest = _LLM_DEST_DIR / filename
+
+    if dest.is_file() and not force:
+        print(
+            f"LLM model already present at {dest.resolve()} — skipping (use --force to replace)."
+        )
+        return
+
+    if dest.is_file() and force:
+        print(f"Removing existing LLM model at {dest.resolve()} …")
+        dest.unlink()
+
+    print(f"Downloading Qwen2.5-{tag}-Instruct Q4_K_M (~{700 if tag == '0.5b' else 1000} MB) …")
+    _download(url, dest)
+    print(f"LLM model ready at {dest.resolve()}")
+
+
 def main() -> None:
     import argparse
 
@@ -268,6 +303,14 @@ def main() -> None:
         action="store_true",
         help="Download the sherpa-onnx Whisper tiny multilingual model (INT8, ~100 MB)",
     )
+    parser.add_argument(
+        "--llm",
+        nargs="?",
+        const="1.5b",
+        default=None,
+        choices=sorted(_LLM_MODELS),
+        help=f"Download LLM model. Optionally specify size: {', '.join(sorted(_LLM_MODELS))} (default: 1.5b)",
+    )
     args = parser.parse_args()
 
     if not args.no_vosk:
@@ -278,6 +321,8 @@ def main() -> None:
         download_sherpa_onnx(force=args.force)
     if args.whisper:
         download_whisper(force=args.force)
+    if args.llm:
+        download_llm(tag=args.llm, force=args.force)
 
 
 if __name__ == "__main__":

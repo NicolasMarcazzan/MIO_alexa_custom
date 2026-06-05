@@ -5,7 +5,9 @@ import fcntl
 import json
 import logging
 import os
+import re
 import select
+import shutil
 import subprocess
 import threading
 import time
@@ -21,9 +23,15 @@ if TYPE_CHECKING:
 
 from alexa_custom.actions import TelegramClient, dispatch, match_trigger
 from alexa_custom.audio import is_playback_active, play_timeout_beep, play_wake_beep
-from alexa_custom.config import ActionsConfig, Trigger, WakeWordGroup
+from alexa_custom.config import ActionEntry, ActionsConfig, Trigger, WakeWordGroup
+from alexa_custom.llm import LLMEngine
 
 logger = logging.getLogger(__name__)
+
+_llm_engine: LLMEngine | None = None
+_actions_config: Callable[[], ActionsConfig] | None = None
+
+_SKIP_LLM_KEYWORDS = {"timer", "sveglia", "conto alla rovescia"}
 
 _CHUNK = 4096
 _MODEL_PATH = os.environ.get("VOSK_MODEL_PATH", "models/it")
@@ -318,8 +326,6 @@ def resolve_capture_source(input_spec: str | None) -> tuple[str | None, int]:
 
 def start_capture(source: str | None, channels: int = 1) -> subprocess.Popen:
     """Start a low-latency recording process (parec)."""
-    import shutil
-
     tool = shutil.which("parec")
     if not tool:
         tool = shutil.which("pw-record")
@@ -519,6 +525,10 @@ def run_stt_worker(
     input_spec = os.environ.get("INPUT_DEVICE", "").strip() or None
     source, channels = resolve_capture_source(input_spec)
 
+    global _llm_engine, _actions_config
+    _llm_engine = LLMEngine(lambda: _get_config().llm)
+    _actions_config = _get_config
+
     current_config = _get_config()
     logger.info(
         f"STT: wake words={[g.word for g in current_config.wake_words]}, "
@@ -543,6 +553,15 @@ def run_stt_worker(
         logger.error(f"STT backend creation failed: {e}")
         return
     backend_key = (current_config.stt_backend, current_config.stt_model_path)
+
+    if not shutil.which("parec") and not shutil.which("pw-record"):
+        logger.warning(
+            "Neither parec nor pw-record found — audio capture unavailable. "
+            "Install pulseaudio-utils on the target board."
+        )
+        if stt_ready_event is not None:
+            stt_ready_event.set()
+        return
 
     _dispatch_loop = asyncio.new_event_loop()
     try:
@@ -751,6 +770,38 @@ def capture_transcript(
     return " ".join(transcript_parts).strip()
 
 
+def _build_listen_fn(
+    proc: subprocess.Popen,
+    channels: int,
+    backend: STTBackend,
+    command_timeout: float,
+    stop_event: threading.Event,
+    on_stt_event: Callable[[str, dict], None] | None = None,
+) -> Callable[[float, int, list[str] | None, bool], Awaitable[str]]:
+    async def _listen_fn(
+        timeout: float,
+        flush_ms: int = 0,
+        phrases: list[str] | None = None,
+        start_after_playback: bool = False,
+    ) -> str:
+        if on_stt_event:
+            on_stt_event("wake", {"word": "(reply)", "timeout": timeout})
+        return await asyncio.to_thread(
+            capture_transcript,
+            proc,
+            channels,
+            backend,
+            timeout,
+            stop_event,
+            on_stt_event,
+            flush_ms=flush_ms,
+            phrases=phrases,
+            start_after_playback=start_after_playback,
+        )
+
+    return _listen_fn
+
+
 def _single_stage_loop(
     proc: subprocess.Popen,
     channels: int,
@@ -773,27 +824,14 @@ def _single_stage_loop(
     if on_stt_event:
         on_stt_event("listening", {"wake_words": [g.word for g in config.wake_words]})
 
-    async def _listen_fn(
-        timeout: float,
-        flush_ms: int = 0,
-        phrases: list[str] | None = None,
-        start_after_playback: bool = False,
-    ) -> str:
-        # Emit event for UI to show we are listening for a reply
-        if on_stt_event:
-            on_stt_event("wake", {"word": "(reply)", "timeout": timeout})
-        return await asyncio.to_thread(
-            capture_transcript,
-            proc,
-            channels,
-            backend,
-            timeout,
-            stop_event,
-            on_stt_event,
-            flush_ms=flush_ms,
-            phrases=phrases,
-            start_after_playback=start_after_playback,
-        )
+    _listen_fn = _build_listen_fn(
+        proc,
+        channels,
+        backend,
+        config.command_timeout,
+        stop_event,
+        on_stt_event,
+    )
 
     assert proc.stdout is not None
     _stall_logged = False
@@ -884,12 +922,46 @@ def _single_stage_loop(
             _play_timeout()
             continue
 
+        if command and len(command.split()) <= 1:
+            if on_stt_event:
+                on_stt_event("nomatch", {"transcript": command})
+            from alexa_custom.tts import get_engine
+
+            get_engine().say("Non ho capito", "it-IT")
+            cooldown_until = time.monotonic() + 2.0
+            continue
+
         triggers = _resolve_triggers(wake_group, config.triggers)
         trigger, trigger_vars = match_trigger(command, triggers)
         if trigger is None:
             if on_stt_event:
                 on_stt_event("nomatch", {"transcript": command})
-            _play_timeout()
+            if any(kw in command.lower() for kw in _SKIP_LLM_KEYWORDS):
+                logger.info(
+                    f"Timer/sveglia keyword in '{command}' — forcing timer_status, skipping LLM"
+                )
+                _dispatch_timer_status(
+                    dispatch_loop,
+                    telegram_client=telegram_client,
+                    livekit_connect_fn=livekit_connect_fn,
+                    livekit_connected=livekit_connected_flag.is_set(),
+                    listen_fn=_listen_fn,
+                    on_stt_event=on_stt_event,
+                    mqtt_client=mqtt_client,
+                )
+            elif not _llm_fallback(
+                command,
+                dispatch_loop,
+                triggers=triggers,
+                telegram_client=telegram_client,
+                livekit_connect_fn=livekit_connect_fn,
+                livekit_connected=livekit_connected_flag.is_set(),
+                listen_fn=_listen_fn,
+                on_stt_event=on_stt_event,
+                mqtt_client=mqtt_client,
+            ):
+                _play_timeout()
+            cooldown_until = time.monotonic() + 2.0
             continue
 
         if on_stt_event:
@@ -1072,6 +1144,7 @@ def _recognition_loop(
                         loop=loop,
                         dispatch_loop=dispatch_loop,
                     )
+                    cooldown_until = time.monotonic() + 2.0
                     logger.debug(
                         f"two-stage: dispatch returned — livekit_flag={livekit_connected_flag.is_set()} "
                         f"was_gated={was_gated} was_playing={was_playing}"
@@ -1223,50 +1296,66 @@ def _wake_detected(
         _play_timeout()
         return
 
-    if mqtt_client:
-        payload = json.dumps(
-            {"text": transcript, "wake_word": wake_group.word, "timestamp": time.time()}
+    if transcript and len(transcript.split()) <= 1:
+        logger.info(
+            f"Short command ({len(transcript.split())} words) — 'non ho capito'"
         )
-        mqtt_client.publish_threadsafe(
-            f"{mqtt_client.topic_prefix}/{mqtt_client.node_id}/command",
-            payload,
-            loop=loop,
-        )
+        if on_stt_event:
+            on_stt_event("nomatch", {"transcript": transcript})
+        from alexa_custom.tts import get_engine
+
+        get_engine().say("Non ho capito", "it-IT")
+        return
 
     triggers = _resolve_triggers(wake_group, config.triggers)
     trigger, trigger_vars = match_trigger(transcript, triggers)
     if trigger is None:
         if on_stt_event:
             on_stt_event("nomatch", {"transcript": transcript})
-        _play_timeout()
+        if any(kw in transcript.lower() for kw in _SKIP_LLM_KEYWORDS):
+            logger.info(
+                f"Timer/sveglia keyword in '{transcript}' — forcing timer_status, skipping LLM"
+            )
+            _dispatch_timer_status(
+                dispatch_loop,
+                telegram_client=telegram_client,
+                livekit_connect_fn=livekit_connect_fn,
+                livekit_connected=livekit_connected_flag.is_set(),
+                listen_fn=_build_listen_fn(
+                    proc,
+                    channels,
+                    backend,
+                    config.command_timeout,
+                    stop_event,
+                    on_stt_event,
+                ),
+                on_stt_event=on_stt_event,
+                mqtt_client=mqtt_client,
+            )
+        elif not _llm_fallback(
+            transcript,
+            dispatch_loop,
+            triggers=triggers,
+            telegram_client=telegram_client,
+            livekit_connect_fn=livekit_connect_fn,
+            livekit_connected=livekit_connected_flag.is_set(),
+            listen_fn=_build_listen_fn(
+                proc,
+                channels,
+                backend,
+                config.command_timeout,
+                stop_event,
+                on_stt_event,
+            ),
+            on_stt_event=on_stt_event,
+            mqtt_client=mqtt_client,
+        ):
+            _play_timeout()
         return
 
     if on_stt_event:
         on_stt_event("matched", {"transcript": transcript, "trigger": trigger.phrase})
 
-    async def _listen_fn(
-        timeout: float,
-        flush_ms: int = 0,
-        phrases: list[str] | None = None,
-        start_after_playback: bool = False,
-    ) -> str:
-        # Emit event for UI to show we are listening for a reply
-        if on_stt_event:
-            on_stt_event("wake", {"word": "(reply)", "timeout": timeout})
-        return await asyncio.to_thread(
-            capture_transcript,
-            proc,
-            channels,
-            backend,
-            timeout,
-            stop_event,
-            on_stt_event,
-            flush_ms=flush_ms,
-            phrases=phrases,
-            start_after_playback=start_after_playback,
-        )
-
-    # Dispatch using the persistent loop (we're in a daemon thread, not async context)
     connected = livekit_connected_flag.is_set()
     try:
         _dloop = dispatch_loop or asyncio.new_event_loop()
@@ -1276,13 +1365,121 @@ def _wake_detected(
                 telegram_client,
                 livekit_connect_fn,
                 livekit_connected=connected,
-                listen_fn=_listen_fn,
+                listen_fn=_build_listen_fn(
+                    proc,
+                    channels,
+                    backend,
+                    config.command_timeout,
+                    stop_event,
+                    on_stt_event,
+                ),
                 on_stt_event=on_stt_event,
                 trigger_vars=trigger_vars,
             )
         )
     except Exception as e:
         logger.error(f"Action dispatch failed: {e}")
+
+
+def _dispatch_timer_status(
+    dispatch_loop: asyncio.AbstractEventLoop | None,
+    telegram_client: TelegramClient | None = None,
+    livekit_connect_fn: Callable[[], Awaitable[None]] | None = None,
+    livekit_connected: bool = False,
+    listen_fn: Callable[[float], Awaitable[str]] | None = None,
+    on_stt_event: Callable[[str, dict], None] | None = None,
+    mqtt_client: MQTTClient | None = None,
+) -> None:
+    fake_trigger = Trigger(
+        phrase="(keyword: timer)",
+        actions=[ActionEntry(type="timer_status")],
+    )
+    try:
+        _dloop = dispatch_loop or asyncio.new_event_loop()
+        _dloop.run_until_complete(
+            dispatch(
+                fake_trigger,
+                telegram_client=telegram_client,
+                livekit_connect_fn=livekit_connect_fn,
+                livekit_connected=livekit_connected,
+                listen_fn=listen_fn,
+                on_stt_event=on_stt_event,
+                mqtt_client=mqtt_client,
+            )
+        )
+    except Exception as e:
+        logger.error(f"Timer status dispatch failed: {e}")
+
+
+def _llm_fallback(
+    transcript: str,
+    dispatch_loop: asyncio.AbstractEventLoop | None,
+    triggers: list[Trigger] | None = None,
+    telegram_client: TelegramClient | None = None,
+    livekit_connect_fn: Callable[[], Awaitable[None]] | None = None,
+    livekit_connected: bool = False,
+    listen_fn: Callable[[float], Awaitable[str]] | None = None,
+    on_stt_event: Callable[[str, dict], None] | None = None,
+    mqtt_client: MQTTClient | None = None,
+) -> bool:
+    if _llm_engine is None:
+        return False
+    config = _llm_engine._get_llm_config()
+    if not config or not config.enabled:
+        return False
+    try:
+        _dloop = dispatch_loop or asyncio.new_event_loop()
+
+        async def _run():
+            from alexa_custom.knowledge import fetch_wikipedia_context
+
+            corrected = await _llm_engine.rewrite(transcript)
+            logger.info(f"STT corrected → '{corrected}'")
+
+            if triggers:
+                trigger, trigger_vars = match_trigger(corrected, triggers)
+                if trigger is not None:
+                    logger.info(f"Post-correction: matched trigger '{trigger.phrase}'")
+                    await dispatch(
+                        trigger,
+                        telegram_client=telegram_client,
+                        livekit_connect_fn=livekit_connect_fn,
+                        livekit_connected=livekit_connected,
+                        listen_fn=listen_fn,
+                        on_stt_event=on_stt_event,
+                        mqtt_client=mqtt_client,
+                        trigger_vars=trigger_vars,
+                    )
+                    return True
+
+            knowledge = _actions_config().knowledge if _actions_config else None
+            if knowledge and knowledge.enabled and knowledge.wikipedia:
+                ctx = await fetch_wikipedia_context(corrected, knowledge.wikipedia_lang)
+                if ctx:
+                    logger.info("Wikipedia found context — answering with LLM")
+                    return await _llm_engine.generate(f"{ctx}\n\nDomanda: {corrected}")
+
+            return await _llm_engine.generate(corrected)
+
+        response = _dloop.run_until_complete(_run())
+        if response is True:
+            return True
+        if response:
+            from alexa_custom.tts import get_engine
+
+            sentences = re.split(r"(?<=[.!?])\s+", response)
+            kept = []
+            for s in sentences:
+                kept.append(s)
+                if sum(len(k.split()) for k in kept) >= 23:
+                    break
+            response = " ".join(kept)
+            get_engine().say(response, "it-IT")
+            time.sleep(1.5)
+            return True
+    except Exception as e:
+        logger.error(f"LLM fallback failed: {e}")
+    return False
 
 
 def _play_timeout() -> None:

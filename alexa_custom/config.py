@@ -30,6 +30,25 @@ class Trigger:
 
 
 @dataclass
+class LLMConfig:
+    enabled: bool = False
+    model_path: str = ""
+    system_prompt: str = ""
+    max_tokens: int = 128
+    temperature: float = 0.7
+    seed: int = 0
+    repeat_penalty: float = 1.0
+    stt_correction_prompt: str = ""
+
+
+@dataclass
+class KnowledgeConfig:
+    enabled: bool = False
+    wikipedia: bool = True
+    wikipedia_lang: str = "it"
+
+
+@dataclass
 class WakeWordGroup:
     word: str
     aliases: list[str] = field(default_factory=list)
@@ -54,6 +73,8 @@ class ActionsConfig:
     stt_backend: str = "vosk"
     stt_model_path: str | None = None
     output_volume: float = 0.5
+    llm: LLMConfig = field(default_factory=LLMConfig)
+    knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
 
 
 def _parse_actions(raw_actions: list[Any], path_prefix: str) -> list[ActionEntry]:
@@ -247,6 +268,29 @@ def _parse_actions_config(raw: dict, source: str = "config") -> ActionsConfig:
             f"{source}: 'stt.backend' must be 'vosk', 'sherpa-onnx', or 'whisper', got {stt_backend!r}"
         )
 
+    llm_section = raw.get("llm") or {}
+    if not isinstance(llm_section, dict):
+        raise ConfigError(f"{source}: 'llm' must be a mapping if present")
+    llm_config = LLMConfig(
+        enabled=bool(llm_section.get("enabled", False)),
+        model_path=str(llm_section.get("model_path", "")),
+        system_prompt=str(llm_section.get("system_prompt", "")),
+        max_tokens=int(llm_section.get("max_tokens", 128)),
+        temperature=float(llm_section.get("temperature", 0.7)),
+        seed=int(llm_section.get("seed", 0)),
+        repeat_penalty=float(llm_section.get("repeat_penalty", 1.0)),
+        stt_correction_prompt=str(llm_section.get("stt_correction_prompt", "")),
+    )
+
+    knowledge_section = raw.get("knowledge") or {}
+    if not isinstance(knowledge_section, dict):
+        raise ConfigError(f"{source}: 'knowledge' must be a mapping if present")
+    knowledge_config = KnowledgeConfig(
+        enabled=bool(knowledge_section.get("enabled", False)),
+        wikipedia=bool(knowledge_section.get("wikipedia", True)),
+        wikipedia_lang=str(knowledge_section.get("wikipedia_lang", "it")),
+    )
+
     stt_model_path_raw = stt_section.get("model_path") or raw.get("stt_model_path")
     stt_model_path: str | None = None
     if stt_model_path_raw is not None:
@@ -288,6 +332,8 @@ def _parse_actions_config(raw: dict, source: str = "config") -> ActionsConfig:
         stt_backend=stt_backend,
         stt_model_path=stt_model_path,
         output_volume=output_volume,
+        llm=llm_config,
+        knowledge=knowledge_config,
     )
 
 

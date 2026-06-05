@@ -318,6 +318,76 @@ triggers:
     actions:
       - type: weather
 
+  # --- timer: set a countdown timer ---
+  # Duration is parsed from natural language: "2 minuti", "1 ora e 30 minuti", etc.
+  - phrase: "metti un timer da {duration}"
+    actions:
+      - type: timer
+  - phrase: "metti un timer di {duration}"
+    actions:
+      - type: timer
+  - phrase: "metti un timer per {duration}"
+    actions:
+      - type: timer
+  - phrase: "imposta un timer da {duration}"
+    actions:
+      - type: timer
+  - phrase: "imposta un timer di {duration}"
+    actions:
+      - type: timer
+  - phrase: "attiva un timer di {duration}"
+    actions:
+      - type: timer
+  - phrase: "crea un timer da {duration}"
+    actions:
+      - type: timer
+  - phrase: "avvia un timer da {duration}"
+    actions:
+      - type: timer
+  - phrase: "fai partire un timer da {duration}"
+    actions:
+      - type: timer
+  - phrase: "avvia un conto alla rovescia di {duration}"
+    actions:
+      - type: timer
+  - phrase: "metti un conto alla rovescia da {duration}"
+    actions:
+      - type: timer
+
+  # --- timer_cancel: stop ringing or cancel active timers ---
+  - phrase: "ferma il timer"
+    actions:
+      - type: timer_cancel
+  - phrase: "ferma tutti i timer"
+    actions:
+      - type: timer_cancel
+  - phrase: "annulla il timer"
+    actions:
+      - type: timer_cancel
+  - phrase: "annulla tutti i timer"
+    actions:
+      - type: timer_cancel
+  - phrase: "stop"
+    actions:
+      - type: timer_cancel
+  - phrase: "basta"
+    actions:
+      - type: timer_cancel
+
+  # --- timer_status: check remaining time ---
+  - phrase: "quanto manca"
+    actions:
+      - type: timer_status
+  - phrase: "quanto manca al timer"
+    actions:
+      - type: timer_status
+  - phrase: "quanto tempo rimane"
+    actions:
+      - type: timer_status
+  - phrase: "timer"
+    actions:
+      - type: timer_status
+
   # --- date ---
   - phrase: "che giorno è"
     actions:

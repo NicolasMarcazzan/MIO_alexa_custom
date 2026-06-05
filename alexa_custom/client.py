@@ -914,6 +914,11 @@ def main() -> None:
                 main_tasks = []
                 loop = asyncio.get_running_loop()
 
+                # Wire TimerManager to the event loop
+                from alexa_custom.timer_manager import manager as timer_manager
+
+                timer_manager.set_loop(loop)
+
                 # Register MQTT reload callback (reconnects if broker settings change)
                 mqtt_reload_cb = make_mqtt_reload_callback(mqtt_holder, loop)
                 config_manager.register_reload_callback(mqtt_reload_cb)

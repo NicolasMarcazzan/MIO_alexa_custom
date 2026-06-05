@@ -52,9 +52,35 @@ class LLMEngine:
             model_path=str(config.model_path),
             n_ctx=512,  # Short context is sufficient for voice Q&A
             n_threads=4,  # Optimized for the Snapdragon 801 CPU cores
+            seed=config.seed,
             verbose=False,
         )
         self._loaded_model_path = config.model_path
+
+    async def rewrite(self, text: str) -> str:
+        config = self._get_llm_config()
+        if not config or not config.stt_correction_prompt:
+            return text
+
+        await asyncio.to_thread(self._init_model)
+        if self._llm is None:
+            return text
+
+        def _sync_rewrite() -> str:
+            messages = [
+                {"role": "system", "content": config.stt_correction_prompt},
+                {"role": "user", "content": text},
+            ]
+            response = self._llm.create_chat_completion(
+                messages=messages,
+                max_tokens=64,
+                temperature=0,
+                repeat_penalty=config.repeat_penalty,
+                seed=config.seed,
+            )
+            return response["choices"][0]["message"]["content"].strip()
+
+        return await asyncio.to_thread(_sync_rewrite)
 
     async def generate(self, text: str) -> str:
         """Asynchronously generate a response using llama-cpp-python."""
@@ -77,6 +103,8 @@ class LLMEngine:
                 messages=messages,
                 max_tokens=config.max_tokens,
                 temperature=config.temperature,
+                repeat_penalty=config.repeat_penalty,
+                seed=config.seed,
             )
             return response["choices"][0]["message"]["content"].strip()
 

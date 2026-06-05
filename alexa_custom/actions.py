@@ -482,6 +482,75 @@ async def handle_time(action: ActionEntry, **_):
     await asyncio.to_thread(get_engine().say, text, "it-IT")
 
 
+@registry.register("timer")
+async def handle_timer(action: ActionEntry, **_):
+    from alexa_custom.timer_manager import manager, parse_duration, format_duration
+    from alexa_custom.tts import get_engine
+
+    trigger_vars = action.params.get("_trigger_vars", {})
+    duration_text = trigger_vars.get("duration") or action.params.get("duration", "")
+    dur = parse_duration(duration_text)
+    if dur is None:
+        logger.warning(f"Timer: could not parse duration '{duration_text}'")
+        await asyncio.to_thread(
+            get_engine().say, "Non ho capito per quanto tempo", "it-IT"
+        )
+        return
+    if dur < 1.0:
+        await asyncio.to_thread(
+            get_engine().say, "Il timer deve durare almeno un secondo", "it-IT"
+        )
+        return
+    if dur > 86400:
+        await asyncio.to_thread(
+            get_engine().say, "Il timer non pu\u00f2 superare 24 ore", "it-IT"
+        )
+        return
+
+    timer_id = manager.set_timer(dur)
+    logger.info(f"Timer {timer_id}: set for {dur}s ({format_duration(dur)})")
+    await asyncio.to_thread(
+        get_engine().say, f"Timer impostato per {format_duration(dur)}", "it-IT"
+    )
+
+
+@registry.register("timer_cancel")
+async def handle_timer_cancel(action: ActionEntry, **_):
+    from alexa_custom.timer_manager import manager
+    from alexa_custom.tts import get_engine
+
+    dismissed = manager.dismiss_ringing()
+    if dismissed:
+        logger.info(f"Timer(s) dismissed: {dismissed}")
+        await asyncio.to_thread(get_engine().say, "Timer fermato", "it-IT")
+        return
+
+    cancelled = manager.cancel_all()
+    if cancelled:
+        logger.info(f"Timer(s) cancelled: {cancelled}")
+        await asyncio.to_thread(get_engine().say, "Timer annullato", "it-IT")
+        return
+
+    await asyncio.to_thread(
+        get_engine().say, "Non c'\u00e8 nessun timer attivo", "it-IT"
+    )
+
+
+@registry.register("timer_status")
+async def handle_timer_status(action: ActionEntry, **_):
+    from alexa_custom.timer_manager import manager
+    from alexa_custom.tts import get_engine
+
+    text = manager.get_active_timers_text()
+    if text is None:
+        if manager.has_ringing():
+            text = "C'\u00e8 un timer che sta suonando"
+        else:
+            text = "Non c'\u00e8 nessun timer attivo"
+    logger.info(f"Timer status: {text}")
+    await asyncio.to_thread(get_engine().say, text, "it-IT")
+
+
 async def _run_action(
     action: ActionEntry,
     telegram_client: TelegramClient,
