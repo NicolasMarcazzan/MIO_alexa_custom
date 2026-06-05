@@ -133,11 +133,6 @@ _HTML = """\
       <span class="vdb" id="spk-db">-∞ dB</span>
     </div>
     <div id="stt"><span class="si">○</span><span style="color:#555">STT inactive</span></div>
-    <div id="llm-ind" style="margin-top:6px;padding-top:6px;border-top:1px solid #333;min-height:24px;display:flex;align-items:center;gap:6px;">
-      <span class="si" style="color:#555">◇</span>
-      <span style="color:#555">LLM idle</span>
-      <span id="llm-txt" style="color:#888;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px"></span>
-    </div>
     <div id="ctl"><button id="btn-restart" onclick="sendCtrl('restart')">Restart</button></div>
   </div>
   <div id="main">
@@ -247,18 +242,6 @@ _HTML = """\
             addHistoryWake(_lastWakeWord);
             updateInteraction(_lastWakeWord, (m.text ? '”'+m.text+'” ' : '') + '✗ no match', true);
             _lastWakeWord = '';
-          }
-          if (m.state === 'llm_query') {
-            const txt = m.transcript || '';
-            document.getElementById('llm-txt').textContent = '→ ' + esc(txt);
-            document.querySelector('#llm-ind .si').textContent = '◌';
-            document.querySelector('#llm-ind .si').style.color = '#4dd0e1';
-          }
-          if (m.state === 'llm_reply') {
-            const txt = m.text || '';
-            document.getElementById('llm-txt').textContent = '→ ' + esc(txt);
-            document.querySelector('#llm-ind .si').textContent = '✓';
-            document.querySelector('#llm-ind .si').style.color = '#4caf50';
           }
           setStt(m.state, m.text||m.word||m.transcript||'', m);
           break;
@@ -408,12 +391,6 @@ _HTML = """\
         case 'nomatch':
           el.innerHTML = '<span class=”si snm”>✗</span>'
             + '<span class=”snm”>' + (text ? '”' + esc(text) + '” ' : '') + 'no match</span>'; break;
-        case 'llm_query':
-          el.innerHTML = '<span class=”si” style=”color:#4dd0e1”>◌</span>'
-            + '<span style=”color:#4dd0e1”>LLM: ' + esc(text) + ' …</span>'; break;
-        case 'llm_reply':
-          el.innerHTML = '<span class=”si” style=”color:#4caf50”>✓</span>'
-            + '<span style=”color:#4caf50”>LLM: “' + esc(text) + '”</span>'; break;
         case 'gated':
           el.innerHTML = '<span class=”si” style=”color:#555”>⏸</span>'
             + '<span style=”color:#555”>STT paused during call</span>'; break;
@@ -608,8 +585,6 @@ class WebServer:
             "matched",
             "nomatch",
             "gated",
-            "llm_query",
-            "llm_reply",
         ):
             self._state["stt_state"] = event
             self._state["stt_text"] = data.get(

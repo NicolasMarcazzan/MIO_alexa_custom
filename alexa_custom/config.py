@@ -40,15 +40,6 @@ _VALID_MODES = {"two-stage", "single-stage"}
 
 
 @dataclass
-class LLMConfig:
-    enabled: bool = False
-    model_path: str = ""
-    system_prompt: str = "Sei un assistente vocale casalingo. Rispondi in modo breve e conciso, massimo 3 frasi. Rispondi in italiano."
-    max_tokens: int = 128
-    temperature: float = 0.7
-
-
-@dataclass
 class ActionsConfig:
     wake_words: list[WakeWordGroup]
     command_timeout: float
@@ -63,7 +54,6 @@ class ActionsConfig:
     stt_backend: str = "vosk"
     stt_model_path: str | None = None
     output_volume: float = 0.5
-    llm: LLMConfig | None = None
 
 
 def _parse_actions(raw_actions: list[Any], path_prefix: str) -> list[ActionEntry]:
@@ -266,27 +256,7 @@ def _parse_actions_config(raw: dict, source: str = "config") -> ActionsConfig:
 
     output_volume = float(raw.get("output_volume", 0.5))
     if not (0.0 <= output_volume <= 1.0):
-        raise ConfigError(
-            f"{source}: 'output_volume' must be between 0.0 and 1.0, got {output_volume}"
-        )
-
-    llm_section = raw.get("llm")
-    llm_config: LLMConfig | None = None
-    if llm_section is not None:
-        if not isinstance(llm_section, dict):
-            raise ConfigError(f"{source}: 'llm' must be a mapping if present")
-        llm_config = LLMConfig(
-            enabled=bool(llm_section.get("enabled", False)),
-            model_path=str(llm_section.get("model_path", "")),
-            system_prompt=str(
-                llm_section.get(
-                    "system_prompt",
-                    "Sei un assistente vocale casalingo. Rispondi in modo breve e conciso, massimo 3 frasi. Rispondi in italiano.",
-                )
-            ),
-            max_tokens=int(llm_section.get("max_tokens", 128)),
-            temperature=float(llm_section.get("temperature", 0.7)),
-        )
+        raise ConfigError(f"{source}: 'output_volume' must be between 0.0 and 1.0, got {output_volume}")
 
     on_startup: list[ActionEntry] = []
     raw_startup = raw.get("on_startup")
@@ -318,7 +288,6 @@ def _parse_actions_config(raw: dict, source: str = "config") -> ActionsConfig:
         stt_backend=stt_backend,
         stt_model_path=stt_model_path,
         output_volume=output_volume,
-        llm=llm_config,
     )
 
 

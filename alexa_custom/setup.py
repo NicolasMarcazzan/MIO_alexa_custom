@@ -110,10 +110,7 @@ def download_whisper(force: bool = False) -> None:
     # The archive extracts to sherpa-onnx-whisper-tiny/
     extracted = Path("sherpa-onnx-whisper-tiny")
     if not extracted.is_dir():
-        print(
-            "Extracted directory not found — archive structure unexpected.",
-            file=sys.stderr,
-        )
+        print("Extracted directory not found — archive structure unexpected.", file=sys.stderr)
         sys.exit(1)
 
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -139,29 +136,6 @@ _VOSK_DEST = "models/it"
 
 # Piper voice files live in subdirectories under rhasspy/piper-voices on HF.
 # Mapping: voice_name -> (language_group, speaker_dir, quality_dir).
-_LLM_MODEL_URL = (
-    "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main"
-    "/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-)
-_LLM_DEST = Path("models/llm/qwen2.5-0.5b-instruct-q4_k_m.gguf")
-
-
-def download_llm(force: bool = False) -> None:
-    dest = _LLM_DEST
-    if dest.is_file() and not force:
-        print(
-            f"LLM model already present at {dest.resolve()} — skipping (use --force to replace)."
-        )
-        return
-    if dest.exists() and force:
-        print(f"Removing existing LLM model at {dest.resolve()} …")
-        dest.unlink()
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    print("Downloading Qwen2.5-0.5B-Instruct Q4_K_M (~350 MB) …")
-    _download(_LLM_MODEL_URL, dest)
-    print(f"LLM model ready at {dest.resolve()}")
-
-
 _PIPER_VOICES = {
     "it_IT-paola-medium": ("it", "paola", "medium"),
     "it_IT-riccardo-x_low": ("it", "riccardo", "x_low"),
@@ -294,11 +268,6 @@ def main() -> None:
         action="store_true",
         help="Download the sherpa-onnx Whisper tiny multilingual model (INT8, ~100 MB)",
     )
-    parser.add_argument(
-        "--llm",
-        action="store_true",
-        help="Download the Qwen2.5-0.5B-Instruct GGUF model for LLM fallback Q&A (~350 MB)",
-    )
     args = parser.parse_args()
 
     if not args.no_vosk:
@@ -309,8 +278,6 @@ def main() -> None:
         download_sherpa_onnx(force=args.force)
     if args.whisper:
         download_whisper(force=args.force)
-    if args.llm:
-        download_llm(force=args.force)
 
 
 if __name__ == "__main__":
