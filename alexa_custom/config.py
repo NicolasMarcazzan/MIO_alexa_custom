@@ -70,6 +70,8 @@ class ActionsConfig:
     tts_preroll_ms: int = 400
     tts_backend: str = "piper"
     tts_voice: str = "it_IT-paola-medium"
+    tts_context_analysis: bool = True
+    tts_barge_in: bool = False
     stt_backend: str = "vosk"
     stt_model_path: str | None = None
     output_volume: float = 0.5
@@ -262,6 +264,11 @@ def _parse_actions_config(raw: dict, source: str = "config") -> ActionsConfig:
     if not isinstance(stt_section, dict):
         raise ConfigError(f"{source}: 'stt' must be a mapping if present")
 
+    tts_context_analysis = bool(
+        tts_section.get("context_analysis", raw.get("tts_context_analysis", True))
+    )
+    tts_barge_in = bool(tts_section.get("barge_in", raw.get("tts_barge_in", False)))
+
     stt_backend = str(stt_section.get("backend", raw.get("stt_backend", "vosk")))
     if stt_backend not in ("vosk", "sherpa-onnx", "whisper"):
         raise ConfigError(
@@ -300,7 +307,9 @@ def _parse_actions_config(raw: dict, source: str = "config") -> ActionsConfig:
 
     output_volume = float(raw.get("output_volume", 0.5))
     if not (0.0 <= output_volume <= 1.0):
-        raise ConfigError(f"{source}: 'output_volume' must be between 0.0 and 1.0, got {output_volume}")
+        raise ConfigError(
+            f"{source}: 'output_volume' must be between 0.0 and 1.0, got {output_volume}"
+        )
 
     on_startup: list[ActionEntry] = []
     raw_startup = raw.get("on_startup")
@@ -329,6 +338,8 @@ def _parse_actions_config(raw: dict, source: str = "config") -> ActionsConfig:
         tts_preroll_ms=tts_preroll_ms,
         tts_backend=tts_backend,
         tts_voice=tts_voice,
+        tts_context_analysis=tts_context_analysis,
+        tts_barge_in=tts_barge_in,
         stt_backend=stt_backend,
         stt_model_path=stt_model_path,
         output_volume=output_volume,

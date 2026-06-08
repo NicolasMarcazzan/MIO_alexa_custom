@@ -22,7 +22,12 @@ if TYPE_CHECKING:
     from alexa_custom.mqtt import MQTTClient
 
 from alexa_custom.actions import TelegramClient, dispatch, match_trigger
-from alexa_custom.audio import is_playback_active, play_timeout_beep, play_wake_beep
+from alexa_custom.audio import (
+    is_playback_active,
+    play_timeout_beep,
+    play_wake_beep,
+    signal_barge_in,
+)
 from alexa_custom.config import ActionEntry, ActionsConfig, Trigger, WakeWordGroup
 from alexa_custom.llm import LLMEngine
 
@@ -429,6 +434,13 @@ def _resolve_triggers(group: WakeWordGroup, fallback: list[Trigger]) -> list[Tri
     return group.triggers if group.triggers else fallback
 
 
+def _check_barge_in(raw_data: bytes, channels: int) -> None:
+    """If the user speaks during TTS playback, signal the TTS to stop."""
+    data = _downmix_to_mono(raw_data, channels)
+    if _rms_level(data) > _STAGE1_RMS_THRESHOLD * 2:
+        signal_barge_in()
+
+
 def _rms_level(data: bytes) -> float:
     samples = np.frombuffer(data, dtype=np.int16)
     n = len(samples)
@@ -709,6 +721,7 @@ def capture_transcript(
 
         if is_playback_active():
             was_playing = True
+            _check_barge_in(raw_data, channels)
             continue
 
         if was_playing:
@@ -852,6 +865,7 @@ def _single_stage_loop(
 
         if is_playback_active():
             was_playing = True
+            _check_barge_in(raw_data, channels)
             continue
 
         if was_playing:
@@ -1047,6 +1061,8 @@ def _recognition_loop(
 
         if is_playback_active():
             was_playing = True
+            # Barge-in: if mic picks up speech during playback, signal TTS to stop.
+            _check_barge_in(raw_data, channels)
             continue
 
         if was_playing:
@@ -1482,6 +1498,70 @@ def _play_timeout() -> None:
         play_timeout_beep()
     except Exception as e:
         logger.debug(f"Timeout beep failed: {e}")
+
+
+class TTSMonitor:
+    """Monitors TTS output via loopback capture using Vosk word-by-word.
+
+    Reads the parec pipe from start_tts_monitor() and feeds it through
+    a Vosk KaldiRecognizer with SetWords(True) to track the current
+    word being spoken by TTS. Used for smart barge-in (e.g., detect
+    when TTS has finished a specific phrase before interrupting).
+    """
+
+    def __init__(self, model_path: str) -> None:
+        from vosk import Model, KaldiRecognizer
+
+        self._model = Model(model_path)
+        self._recognizer = KaldiRecognizer(self._model, 16000)
+        self._recognizer.SetWords(True)
+        self._current_word: str | None = None
+        self._current_word_lock = threading.Lock()
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    @property
+    def current_word(self) -> str | None:
+        with self._current_word_lock:
+            return self._current_word
+
+    def start(self, source: subprocess.Popen) -> None:
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(source,),
+            daemon=True,
+            name="tts-monitor",
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
+
+    def _run(self, source: subprocess.Popen) -> None:
+        import json
+
+        assert source.stdout is not None
+        while self._running:
+            try:
+                data = source.stdout.read(4000)
+            except Exception:
+                break
+            if not data:
+                break
+            if self._recognizer.AcceptWaveform(data):
+                pass
+            else:
+                partial = json.loads(self._recognizer.PartialResult())
+                partial_text = partial.get("partial", "")
+                words = partial_text.split()
+                with self._current_word_lock:
+                    self._current_word = words[-1] if words else None
+        with self._current_word_lock:
+            self._current_word = None
 
 
 def start_stt_thread(

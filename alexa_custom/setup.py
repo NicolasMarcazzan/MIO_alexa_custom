@@ -94,7 +94,7 @@ def download_whisper(force: bool = False) -> None:
         shutil.rmtree(dest)
 
     archive = Path("sherpa-onnx-whisper-tiny.tar.bz2")
-    print(f"Downloading Whisper tiny model (INT8, ~100 MB) …")
+    print("Downloading Whisper tiny model (INT8, ~100 MB) …")
     _download(_WHISPER_URL, archive)
 
     print(f"Extracting {archive} …")
@@ -110,7 +110,10 @@ def download_whisper(force: bool = False) -> None:
     # The archive extracts to sherpa-onnx-whisper-tiny/
     extracted = Path("sherpa-onnx-whisper-tiny")
     if not extracted.is_dir():
-        print("Extracted directory not found — archive structure unexpected.", file=sys.stderr)
+        print(
+            "Extracted directory not found — archive structure unexpected.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -257,7 +260,9 @@ def download_llm(tag: str = "1.5b", force: bool = False) -> None:
         print(f"Removing existing LLM model at {dest.resolve()} …")
         dest.unlink()
 
-    print(f"Downloading Qwen2.5-{tag}-Instruct Q4_K_M (~{700 if tag == '0.5b' else 1000} MB) …")
+    print(
+        f"Downloading Qwen2.5-{tag}-Instruct Q4_K_M (~{700 if tag == '0.5b' else 1000} MB) …"
+    )
     _download(url, dest)
     print(f"LLM model ready at {dest.resolve()}")
 
@@ -311,6 +316,11 @@ def main() -> None:
         choices=sorted(_LLM_MODELS),
         help=f"Download LLM model. Optionally specify size: {', '.join(sorted(_LLM_MODELS))} (default: 1.5b)",
     )
+    parser.add_argument(
+        "--prosody-model",
+        action="store_true",
+        help="Download the BERT multilingual ONNX model for TTS prosody analysis (~150 MB)",
+    )
     args = parser.parse_args()
 
     if not args.no_vosk:
@@ -323,6 +333,10 @@ def main() -> None:
         download_whisper(force=args.force)
     if args.llm:
         download_llm(tag=args.llm, force=args.force)
+    if args.prosody_model:
+        from alexa_custom.prosody import download_default_model
+
+        download_default_model(force=args.force)
 
 
 if __name__ == "__main__":

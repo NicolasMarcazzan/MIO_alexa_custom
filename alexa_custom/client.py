@@ -806,16 +806,33 @@ def main() -> None:
 
         if config is not None:
             from alexa_custom.actions import TelegramClient
+            from alexa_custom.audio import start_tts_monitor, stop_tts_monitor
             from alexa_custom.tts import init_engine
 
             connect_trigger = threading.Event()
             livekit_connected_flag = threading.Event()
+
+            tts_monitor = None
+            if config.tts_barge_in:
+                tts_monitor_proc = start_tts_monitor()
+                if tts_monitor_proc is not None:
+                    vosk_path = config.stt_model_path or "models/it"
+                    try:
+                        from alexa_custom.stt import TTSMonitor
+
+                        tts_monitor = TTSMonitor(vosk_path)
+                        tts_monitor.start(tts_monitor_proc)
+                    except Exception as e:
+                        logger.warning(f"TTSMonitor init failed: {e}")
 
             init_engine(
                 backend_type=config.tts_backend,
                 voice=config.tts_voice,
                 stt_gated_flag=livekit_connected_flag,
                 preroll_ms=config.tts_preroll_ms,
+                context_analysis=config.tts_context_analysis,
+                barge_in=config.tts_barge_in,
+                tts_monitor=tts_monitor,
             )
 
             async def _livekit_connect_fn_web() -> None:
@@ -899,12 +916,33 @@ def main() -> None:
                 )
                 mqtt_holder[0] = mqtt_client
 
-            # Initialize TTS with gating
+            from alexa_custom.audio import start_tts_monitor, stop_tts_monitor
+
+            # Initialize TTSMonitor (Vosk word-by-word tracking of TTS loopback output)
+            # Must be created before init_engine so the TTS engine can use it for
+            # smart barge-in (logging the current spoken word on interruption).
+            tts_monitor = None
+            if config.tts_barge_in:
+                tts_monitor_proc = start_tts_monitor()
+                if tts_monitor_proc is not None:
+                    vosk_path = config.stt_model_path or "models/it"
+                    try:
+                        from alexa_custom.stt import TTSMonitor
+
+                        tts_monitor = TTSMonitor(vosk_path)
+                        tts_monitor.start(tts_monitor_proc)
+                    except Exception as e:
+                        logger.warning(f"TTSMonitor init failed: {e}")
+
+            # Initialize TTS with gating — passes tts_monitor for barge-in word tracking
             init_engine(
                 backend_type=config.tts_backend,
                 voice=config.tts_voice,
                 stt_gated_flag=livekit_connected_flag,
                 preroll_ms=config.tts_preroll_ms,
+                context_analysis=config.tts_context_analysis,
+                barge_in=config.tts_barge_in,
+                tts_monitor=tts_monitor,
             )
 
             async def _livekit_connect_fn() -> None:
@@ -989,6 +1027,9 @@ def main() -> None:
                 asyncio.run(_run_main_loop())
             finally:
                 stt_stop.set()
+                if tts_monitor is not None:
+                    tts_monitor.stop()
+                    stop_tts_monitor()
                 audio_watcher.stop()
         else:
             try:

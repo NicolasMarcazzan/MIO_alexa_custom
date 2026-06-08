@@ -79,6 +79,25 @@ _audio_lock = threading.Lock()
 # capture resumes. Override via env AUDIO_POST_PLAYBACK_MS.
 _POST_PLAYBACK_MS = int(os.environ.get("AUDIO_POST_PLAYBACK_MS", "100"))
 
+# Barge-in signaling: set by STT when user speaks during playback.
+_barge_in_event = threading.Event()
+
+
+def signal_barge_in() -> None:
+    """Called by STT when user speech is detected during TTS playback."""
+    if _playback_active.is_set():
+        _barge_in_event.set()
+
+
+def is_barge_in_requested() -> bool:
+    """Checked by TTS engine during playback to see if user interrupted."""
+    return _barge_in_event.is_set()
+
+
+def clear_barge_in() -> None:
+    _barge_in_event.clear()
+
+
 # Prepend this much silence to short tones/beeps so the PipeWire sink finishes its
 # cold-start (stream open + device wake) before the audible part begins. Override
 # via env AUDIO_TONE_PREROLL_MS.
@@ -395,6 +414,57 @@ class AudioWatcher(threading.Thread):
             invalidate_sink_cache()
             if self.on_status_change:
                 self.on_status_change(ok, conn)
+
+
+_tts_monitor_proc: subprocess.Popen | None = None
+
+
+def start_tts_monitor() -> subprocess.Popen | None:
+    """Start capturing TTS output via PipeWire loopback.
+
+    Creates a loopback from the default sink monitor to a parec process
+    that streams 16 kHz s16le audio to stdout. Used by TTSMonitor to
+    track TTS output word-by-word.
+    """
+    global _tts_monitor_proc
+    if _tts_monitor_proc is not None:
+        return _tts_monitor_proc
+    parec = shutil.which("parec")
+    if not parec:
+        logger.warning("parec not found — TTS monitor unavailable")
+        return None
+    try:
+        proc = subprocess.Popen(
+            [
+                parec,
+                "--rate=16000",
+                "--channels=1",
+                "--format=s16le",
+                "--latency-msec=1",
+                "--device=@DEFAULT_MONITOR@",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+        _tts_monitor_proc = proc
+        logger.info("TTS monitor started (parec: @DEFAULT_MONITOR@)")
+        return proc
+    except Exception as e:
+        logger.error(f"Failed to start TTS monitor: {e}")
+        return None
+
+
+def stop_tts_monitor() -> None:
+    global _tts_monitor_proc
+    if _tts_monitor_proc is not None:
+        try:
+            _tts_monitor_proc.terminate()
+            _tts_monitor_proc.wait(timeout=3)
+        except Exception:
+            pass
+        _tts_monitor_proc = None
+        logger.debug("TTS monitor stopped")
 
 
 def check_newpie_ready() -> tuple[bool, str]:

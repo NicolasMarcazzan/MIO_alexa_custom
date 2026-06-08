@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import wave
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import numpy as np
 
@@ -21,12 +21,19 @@ logger = logging.getLogger(__name__)
 # Directory where Piper voices (.onnx + .onnx.json) are stored.
 PIPER_VOICES_DIR = Path(os.environ.get("PIPER_VOICES_DIR", "models/piper"))
 
+# Wraps text in SSML voice element so Piper applies SSML tags.
+_SSML_WRAP = '<speak><voice name="{voice}">{text}</voice></speak>'.format
+
 
 class TTSBackend(abc.ABC):
     @abc.abstractmethod
     def say(self, text: str, lang: str = "it-IT") -> None:
         """Speak the given text in the specified language."""
         pass
+
+    def _check_barge_in(self) -> bool:
+        """Returns True if TTS should stop (user interrupted via barge-in)."""
+        return False
 
 
 def _read_wav_as_float32(path: str) -> tuple[np.ndarray, int]:
@@ -50,14 +57,32 @@ def _read_wav_as_float32(path: str) -> tuple[np.ndarray, int]:
 
 class PicoTTS(TTSBackend):
     def __init__(
-        self, stt_gated_flag: threading.Event | None = None, preroll_ms: int = 400
+        self,
+        stt_gated_flag: threading.Event | None = None,
+        preroll_ms: int = 400,
+        barge_in: bool = False,
     ):
         self._stt_gated_flag = stt_gated_flag
         self._preroll_ms = preroll_ms
+        self._barge_in = barge_in
+        self._barge_in_triggered = False
+        self._barge_in_lock = threading.Lock()
+
+    def _check_barge_in(self) -> bool:
+        if not self._barge_in:
+            return False
+        with self._barge_in_lock:
+            if self._barge_in_triggered:
+                return True
+            self._barge_in_triggered = True
+            logger.info("PicoTTS barge-in triggered")
+        return True
 
     def say(self, text: str, lang: str = "it-IT") -> None:
         if not text:
             return
+
+        self._barge_in_triggered = False
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wav_path = f.name
@@ -70,6 +95,9 @@ class PicoTTS(TTSBackend):
                 check=True,
                 stderr=subprocess.DEVNULL,
             )
+
+            if self._check_barge_in():
+                return
 
             samples, samplerate = _read_wav_as_float32(wav_path)
 
@@ -99,6 +127,9 @@ class PiperTTS(TTSBackend):
         voice: str,
         stt_gated_flag: threading.Event | None = None,
         preroll_ms: int = 400,
+        context_analysis: bool = True,
+        barge_in: bool = False,
+        tts_monitor: Any | None = None,
     ):
         from piper import (
             PiperVoice,
@@ -107,6 +138,11 @@ class PiperTTS(TTSBackend):
         self._stt_gated_flag = stt_gated_flag
         self._preroll_ms = preroll_ms
         self._voice_name = voice
+        self._context_analysis = context_analysis
+        self._barge_in = barge_in
+        self._barge_in_triggered = False
+        self._barge_in_lock = threading.Lock()
+        self._tts_monitor = tts_monitor
 
         voice_path = PIPER_VOICES_DIR / f"{voice}.onnx"
         if not voice_path.is_file():
@@ -117,26 +153,68 @@ class PiperTTS(TTSBackend):
 
         logger.info(f"Loading Piper voice: {voice_path}")
         self._voice = PiperVoice.load(str(voice_path))
-        # SampleRate is exposed differently across piper-tts versions; probe both.
         cfg = getattr(self._voice, "config", None)
         self._samplerate = int(
             getattr(cfg, "sample_rate", None)
             or getattr(self._voice, "sample_rate", 22050)
         )
 
+    def _check_barge_in(self) -> bool:
+        if not self._barge_in:
+            return False
+        try:
+            from alexa_custom.audio import is_barge_in_requested, clear_barge_in
+
+            if is_barge_in_requested():
+                clear_barge_in()
+                with self._barge_in_lock:
+                    if self._barge_in_triggered:
+                        return True
+                    self._barge_in_triggered = True
+                    word = (
+                        self._tts_monitor.current_word
+                        if self._tts_monitor is not None
+                        else None
+                    )
+                    if word:
+                        logger.info(f"TTS barge-in triggered (current word: {word!r})")
+                    else:
+                        logger.info("TTS barge-in triggered")
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _preprocess_with_prosody(self, text: str) -> str:
+        if not self._context_analysis:
+            return text
+        try:
+            from alexa_custom.prosody import annotate
+
+            text = annotate(text)
+        except Exception as e:
+            logger.debug(f"Prosody analysis skipped: {e}")
+        # Wrap in SSML so Piper applies <break>, <emphasis>, <prosody> tags.
+        if "<speak>" not in text:
+            text = _SSML_WRAP(voice=self._voice_name, text=text)
+        return text
+
     def say(self, text: str, lang: str = "it-IT") -> None:
         if not text:
             return
 
         try:
+            text = self._preprocess_with_prosody(text)
             logger.info(f"TTS (Piper/{self._voice_name}): '{text}'")
 
-            # piper-tts >=1.2 yields AudioChunk objects with `.audio_int16_array`
-            # or `.audio_int16_bytes`. Older releases (and the binary wrapper)
-            # yielded raw bytes. Handle both shapes.
+            self._barge_in_triggered = False
+
             buffers: list[np.ndarray] = []
             chunk_rate: int | None = None
             for chunk in self._voice.synthesize(text):
+                if self._check_barge_in():
+                    logger.info("PiperTTS: interrupted by barge-in")
+                    break
                 arr = getattr(chunk, "audio_int16_array", None)
                 if arr is None:
                     raw = getattr(chunk, "audio_int16_bytes", None) or bytes(chunk)
@@ -178,9 +256,16 @@ def init_engine(backend_type: str = "piper", **kwargs) -> TTSBackend:
     global _engine
     stt_gated_flag = kwargs.get("stt_gated_flag")
     preroll_ms = kwargs.get("preroll_ms", 400)
+    context_analysis = kwargs.get("context_analysis", True)
+    barge_in = kwargs.get("barge_in", False)
+    tts_monitor = kwargs.get("tts_monitor")
 
     if backend_type == "pico":
-        _engine = PicoTTS(stt_gated_flag=stt_gated_flag, preroll_ms=preroll_ms)
+        _engine = PicoTTS(
+            stt_gated_flag=stt_gated_flag,
+            preroll_ms=preroll_ms,
+            barge_in=barge_in,
+        )
     elif backend_type == "piper":
         voice = kwargs.get("voice", "it_IT-paola-medium")
         try:
@@ -188,10 +273,17 @@ def init_engine(backend_type: str = "piper", **kwargs) -> TTSBackend:
                 voice=voice,
                 stt_gated_flag=stt_gated_flag,
                 preroll_ms=preroll_ms,
+                context_analysis=context_analysis,
+                barge_in=barge_in,
+                tts_monitor=tts_monitor,
             )
         except (ImportError, FileNotFoundError) as e:
             logger.warning(f"Piper unavailable ({e}); falling back to Pico TTS")
-            _engine = PicoTTS(stt_gated_flag=stt_gated_flag, preroll_ms=preroll_ms)
+            _engine = PicoTTS(
+                stt_gated_flag=stt_gated_flag,
+                preroll_ms=preroll_ms,
+                barge_in=barge_in,
+            )
     else:
         raise ValueError(f"Unknown TTS backend: {backend_type}")
     return _engine
